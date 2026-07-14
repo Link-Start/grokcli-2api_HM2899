@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.64** · 偶发流中断修复 · 工具参数别名/Update 合并 · tool_choice 空 200
+**当前版本：v1.9.65** · 断联防抖 · 偶发流中断修复 · 工具参数加固
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.64` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.65` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -139,7 +139,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.64
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.65
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -178,7 +178,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.64
+    image: ghcr.io/hm2899/grokcli-2api:1.9.65
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -416,7 +416,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.64
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.65
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -457,7 +457,11 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v1.9.64**（当前）
+- **v1.9.65**（当前）
+  - **断联防抖**：`is_disconnected` 需连续命中（默认 2，`GROK2API_DISCONNECT_HITS`）才判定 client_gone，避免背压单次 blip 硬切
+  - **stream_started 后置**：仅在真正 yield 出站帧后锁定账号/禁止静默切号，假断联不再阻断 failover
+  - 继承 v1.9.64：软断开终态帧、工具参数别名/Update 合并、xhigh thinking
+- **v1.9.64**
   - **偶发流中断修复**：OpenAI / Anthropic / Responses 软断开不再硬切 SSE；`is_disconnected` 探活异常不再误判 `client_gone`
   - 已开流时始终发出终态帧（finish/`[DONE]`、`message_delta`/`message_stop`、`response.completed`/`failed`），避免 sub2api/Claude Code 停调度
   - **工具参数加固**：Update 双 JSON 合并取更完整对象；`path`/`oldString` 等别名归一为 Claude Code schema；schema 不完整工具不刷出
@@ -501,7 +505,7 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.64**）。  
+> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.65**）。  
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

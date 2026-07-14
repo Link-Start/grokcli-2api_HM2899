@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.64"
+APP_VERSION = "1.9.65"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -2036,6 +2036,47 @@ def _api_key_id(rec: apikeys.ApiKeyRecord | None) -> str | None:
     return s or None
 
 
+class _DisconnectProbe:
+    """Debounced client-disconnect probe for long SSE turns.
+
+    Starlette ``request.is_disconnected()`` can flip true once under write
+    backpressure or briefly when a proxy probes the socket, then go false
+    again. A single hit used to permanently set ``client_gone`` and hard-cut
+    mid-turn (Claude Code / sub2api stop scheduling). Require consecutive
+    true hits before treating the client as gone; probe exceptions never count.
+    """
+
+    def __init__(self, hits_needed: int | None = None) -> None:
+        raw = hits_needed
+        if raw is None:
+            try:
+                raw = int(os.getenv("GROK2API_DISCONNECT_HITS", "2") or 2)
+            except (TypeError, ValueError):
+                raw = 2
+        self.hits_needed = max(1, min(8, int(raw)))
+        self.hits = 0
+        self.gone = False
+
+    async def check(self, probe) -> bool:
+        if self.gone:
+            return True
+        if probe is None:
+            return False
+        try:
+            disconnected = await probe()
+        except Exception:
+            # Backpressure / closed-transport races: do not sticky-latch.
+            return False
+        if disconnected:
+            self.hits += 1
+            if self.hits >= self.hits_needed:
+                self.gone = True
+                return True
+            return False
+        self.hits = 0
+        return False
+
+
 async def _aiter_sse_lines_with_keepalive(
     resp: httpx.Response,
     *,
@@ -3679,6 +3720,7 @@ async def _stream_proxy_with_failover_inner(
         held_finish: str | None = None
         stream_started = False  # True once any content has been sent to client
         client_gone = False
+        disconnect = _DisconnectProbe()
         usage: dict[str, Any] | None = None
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -3788,14 +3830,9 @@ async def _stream_proxy_with_failover_inner(
                     async for line in _aiter_sse_lines_with_keepalive(resp):
                         # Soft disconnect check: keep draining so we can still
                         # emit a terminal finish/tool_calls frame when possible.
-                        # Probe failures must NOT flip client_gone — Starlette's
-                        # is_disconnected() can raise under backpressure and a
-                        # false positive used to hard-cut the SSE mid-turn.
-                        try:
-                            if await client_disconnected():
-                                client_gone = True
-                        except Exception:
-                            pass
+                        # Debounced: a single is_disconnected() blip under
+                        # backpressure must not sticky-latch client_gone.
+                        client_gone = await disconnect.check(client_disconnected)
                         if line is None:
                             # idle keepalive for newapi / reverse proxies
                             if not client_gone:
@@ -3897,11 +3934,9 @@ async def _stream_proxy_with_failover_inner(
                             emit_content, emit_reasoning = None, None
 
                         # Incomplete tool-name previews must NOT set stream_started or bind
-                        # success/affinity. Only outbound frames (or a later
-                        # held-preface flush) count as client-visible model bytes.
-                        if emit_content or emit_reasoning or emit_tool_calls:
-                            stream_started = True
-                            _note_success_once()
+                        # success/affinity. Only outbound frames that are actually
+                        # yielded count as client-visible model bytes — do not
+                        # mark started when client_gone skips the yield below.
                         if finish:
                             # Hold finish until stream drain so we can attach
                             # usage on the same terminal chunk. sub2api/new-api
@@ -3931,9 +3966,13 @@ async def _stream_proxy_with_failover_inner(
                                     )
 
                         if emit_content or emit_reasoning or emit_tool_calls:
-                            stream_started = True
                             if client_gone:
                                 continue
+                            # Only after we know we will yield: bind success and
+                            # lock failover. Premature stream_started + client_gone
+                            # used to block silent account failover on empty turns.
+                            stream_started = True
+                            _note_success_once()
                             # Split content/reasoning and tool_calls into separate
                             # SSE frames. sub2api/Claude Code converters that open
                             # text then tool from one mixed delta can leave the
@@ -5294,15 +5333,13 @@ async def openai_responses(
                             ctype = (resp.headers.get("content-type") or "").lower()
                             if "text/event-stream" in ctype or "stream" in ctype:
                                 client_gone = False
+                                disconnect = _DisconnectProbe()
                                 async for line in _aiter_sse_lines_with_keepalive(resp):
-                                    # Probe failures must NOT flip client_gone —
-                                    # is_disconnected() can raise under backpressure
-                                    # and a false positive hard-cuts mid-turn.
-                                    try:
-                                        if await request.is_disconnected():
-                                            client_gone = True
-                                    except Exception:
-                                        pass
+                                    # Debounced disconnect probe — single blip
+                                    # under backpressure must not sticky-latch.
+                                    client_gone = await disconnect.check(
+                                        request.is_disconnected
+                                    )
                                     if line is None:
                                         # Always poke the client during long thinking /
                                         # tool-prep gaps. SSE comments do NOT open the
@@ -5864,15 +5901,12 @@ async def _stream_anthropic_with_failover_inner(
 
                 ctype = (resp.headers.get("content-type") or "").lower()
                 client_gone = False
+                disconnect = _DisconnectProbe()
                 if "text/event-stream" in ctype or "stream" in ctype:
                     async for line in _aiter_sse_lines_with_keepalive(resp):
-                        # Probe failures must NOT flip client_gone — false
-                        # positives hard-cut the Anthropic SSE mid-turn.
-                        try:
-                            if await client_disconnected():
-                                client_gone = True
-                        except Exception:
-                            pass
+                        # Debounced disconnect probe — single blip under
+                        # backpressure must not sticky-latch client_gone.
+                        client_gone = await disconnect.check(client_disconnected)
                         if line is None:
                             # Always ping during long thinking / tool-prep gaps.
                             # Anthropic pings do NOT open the message envelope, so
