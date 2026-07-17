@@ -260,32 +260,110 @@ func UsageFromOpenAI(value any) (prompt, completion, total, cacheRead, cacheCrea
 	if len(usage) == 0 {
 		return 0, 0, 0, 0, 0, 0
 	}
-	prompt = int64FromAny(usage["prompt_tokens"])
-	completion = int64FromAny(usage["completion_tokens"])
-	total = int64FromAny(usage["total_tokens"])
+	// OpenAI-compatible + Anthropic-ish aliases seen from xAI / relays.
+	prompt = firstInt64(usage, "prompt_tokens", "input_tokens")
+	completion = firstInt64(usage, "completion_tokens", "output_tokens")
+	total = firstInt64(usage, "total_tokens")
 	if total <= 0 {
 		total = prompt + completion
 	}
-	cacheRead = int64FromAny(usage["cached_tokens"])
-	for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
-		if details, _ := usage[key].(map[string]any); details != nil {
-			if cacheRead == 0 {
-				cacheRead = int64FromAny(details["cached_tokens"])
-			}
-			if cacheCreate == 0 {
-				cacheCreate = int64FromAny(details["cache_creation_tokens"])
-			}
+	cacheRead = firstInt64(usage,
+		"cached_tokens",
+		"cache_read_tokens",
+		"cache_read_input_tokens",
+		"prompt_cache_hit_tokens",
+	)
+	cacheCreate = firstInt64(usage,
+		"cache_creation_tokens",
+		"cache_creation_input_tokens",
+		"prompt_cache_creation_tokens",
+	)
+	for _, key := range []string{"prompt_tokens_details", "input_tokens_details", "prompt_token_details", "input_token_details"} {
+		details, _ := usage[key].(map[string]any)
+		if details == nil {
+			continue
+		}
+		if cacheRead == 0 {
+			cacheRead = firstInt64(details, "cached_tokens", "cache_read_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens")
+		}
+		if cacheCreate == 0 {
+			cacheCreate = firstInt64(details, "cache_creation_tokens", "cache_creation_input_tokens", "cache_write_tokens")
 		}
 	}
-	for _, key := range []string{"completion_tokens_details", "output_tokens_details"} {
-		if details, _ := usage[key].(map[string]any); details != nil && reasoning == 0 {
-			reasoning = int64FromAny(details["reasoning_tokens"])
+	// Some relays nest under usage.cache / usage.prompt_cache.
+	for _, key := range []string{"cache", "prompt_cache", "prompt_cache_stats"} {
+		details, _ := usage[key].(map[string]any)
+		if details == nil {
+			continue
+		}
+		if cacheRead == 0 {
+			cacheRead = firstInt64(details, "read", "read_tokens", "cached_tokens", "hit_tokens", "cache_read_tokens")
+		}
+		if cacheCreate == 0 {
+			cacheCreate = firstInt64(details, "write", "write_tokens", "creation_tokens", "cache_creation_tokens")
+		}
+	}
+	for _, key := range []string{"completion_tokens_details", "output_tokens_details", "completion_token_details", "output_token_details"} {
+		details, _ := usage[key].(map[string]any)
+		if details == nil {
+			continue
+		}
+		if reasoning == 0 {
+			reasoning = firstInt64(details, "reasoning_tokens", "thinking_tokens")
 		}
 	}
 	if reasoning == 0 {
-		reasoning = int64FromAny(usage["reasoning_tokens"])
+		reasoning = firstInt64(usage, "reasoning_tokens", "thinking_tokens")
 	}
 	return prompt, completion, total, cacheRead, cacheCreate, reasoning
+}
+
+func firstInt64(m map[string]any, keys ...string) int64 {
+	if m == nil {
+		return 0
+	}
+	for _, key := range keys {
+		if v, ok := m[key]; ok && v != nil {
+			if n := int64FromAny(v); n != 0 || v == 0 || v == int64(0) || v == float64(0) {
+				// accept explicit zero only if key exists; prefer first present numeric
+				if n != 0 {
+					return n
+				}
+				// keep scanning if zero — another alias may hold the real value
+				if _, isNum := asNumber(v); isNum {
+					// remember zero only if nothing else found later
+					// handled by continuing; if all zero return 0
+				}
+			}
+		}
+	}
+	// second pass: return first numeric even if zero
+	for _, key := range keys {
+		if v, ok := m[key]; ok && v != nil {
+			if _, isNum := asNumber(v); isNum {
+				return int64FromAny(v)
+			}
+		}
+	}
+	return 0
+}
+
+func asNumber(value any) (float64, bool) {
+	switch v := value.(type) {
+	case int64:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func int64FromAny(value any) int64 {
@@ -529,7 +607,6 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 		"total_pages": totalPages, "source": "postgres", "store_source": "postgres",
 	}, rows.Err()
 }
-
 
 func (c *Connector) usageCacheAggregate(ctx context.Context, days int) (map[string]any, error) {
 	days = clamp(days, 1, 90, 7)

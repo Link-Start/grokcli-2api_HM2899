@@ -494,7 +494,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 	if chatReq.Stream {
 		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
 		if err != nil {
-			recordChatUsage(r, options, apiKey, "", chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0)
+			recordChatUsage(r, options, apiKey, "", chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
 			writeProxyError(w, err)
 			return
 		}
@@ -514,7 +514,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		if !ok {
 			status = http.StatusBadGateway
 		}
-		recordChatUsage(r, options, apiKey, opened.AccountID, opened.Model, chatReq.Stream, ok, status, started, stats.Usage, err, stats.FirstTokenMS)
+		recordChatUsage(r, options, apiKey, opened.AccountID, opened.Model, chatReq.Stream, ok, status, started, stats.Usage, err, stats.FirstTokenMS, chatReq.Raw)
 		reportChatPool(r, options, opened.AccountID, ok, err, status)
 		return
 	}
@@ -523,11 +523,11 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		defer releaseServerPick(options, result.AccountID)
 	}
 	if err != nil {
-		recordChatUsage(r, options, apiKey, result.AccountID, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0)
+		recordChatUsage(r, options, apiKey, result.AccountID, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
 		writeProxyError(w, err)
 		return
 	}
-	recordChatUsage(r, options, apiKey, result.AccountID, result.Model, chatReq.Stream, true, http.StatusOK, started, result.Usage, nil, 0)
+	recordChatUsage(r, options, apiKey, result.AccountID, result.Model, chatReq.Stream, true, http.StatusOK, started, result.Usage, nil, 0, chatReq.Raw)
 	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK)
 	setProtocolObservationHeaders(w, protocolObservation{
 		Protocol: "openai_chat", AccountID: result.AccountID, PreferAccount: result.PreferAccount,
@@ -603,7 +603,7 @@ func releaseServerPick(options Options, accountID string) {
 	options.PickObserver.ReleasePick(ctx, accountID)
 }
 
-func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int) {
+func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
 	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usage)
 	streamValue := stream
 	var apiKeyID string
@@ -647,7 +647,7 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 				LatencyMS:           &latency,
 				TTFTMS:              ttftPtr,
 				Error:               errText,
-				Detail:              map[string]any{"route": "go_chat"},
+				Detail:              usageDetail("go_chat", requestBody, ttftMS, latency),
 			})
 		}
 		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
@@ -794,7 +794,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		chatReq.Stream = true
 		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
 		if err != nil {
-			recordAnthropicUsage(r, options, apiKey, "", model, true, false, http.StatusBadGateway, started, nil, err, 0)
+			recordAnthropicUsage(r, options, apiKey, "", model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
 			writeAnthropicError(w, http.StatusBadGateway, err.Error(), "api_error")
 			return
 		}
@@ -817,7 +817,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		if !ok {
 			status = http.StatusBadGateway
 		}
-		recordAnthropicUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS)
+		recordAnthropicUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
 		reportChatPool(r, options, opened.AccountID, ok, err, status)
 		return
 	}
@@ -826,11 +826,11 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		defer releaseServerPick(options, result.AccountID)
 	}
 	if err != nil {
-		recordAnthropicUsage(r, options, apiKey, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0)
+		recordAnthropicUsage(r, options, apiKey, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0, raw)
 		writeAnthropicError(w, http.StatusBadGateway, err.Error(), "api_error")
 		return
 	}
-	recordAnthropicUsage(r, options, apiKey, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0)
+	recordAnthropicUsage(r, options, apiKey, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
 	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK)
 	content, reasoning, finish, usage, toolCalls := anthropicCompletionParts(result.Payload)
 	if maxTools > 0 && len(toolCalls) > maxTools {
@@ -926,8 +926,10 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": readyReason(options)})
 		return
 	}
+	var apiKey *auth.APIKeyRecord
 	if options.APIKeys != nil {
-		if _, err := options.APIKeys.Require(r.Context(), r); err != nil {
+		verified, err := options.APIKeys.Require(r.Context(), r)
+		if err != nil {
 			status := http.StatusInternalServerError
 			message := err.Error()
 			if errors.Is(err, auth.ErrInvalidAPIKey) {
@@ -937,6 +939,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 			writeJSON(w, status, map[string]any{"detail": message})
 			return
 		}
+		apiKey = verified
 	}
 	if options.Store == nil && len(options.Candidates) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
@@ -978,7 +981,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	if stream {
 		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
 		if err != nil {
-			recordResponsesUsage(r, options, "", model, true, false, http.StatusBadGateway, started, nil, err, 0)
+			recordResponsesUsage(r, options, apiKey, "", model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
 			writeOpenAIError(w, http.StatusBadGateway, err.Error(), "server_error")
 			return
 		}
@@ -1001,7 +1004,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		if !ok {
 			status = http.StatusBadGateway
 		}
-		recordResponsesUsage(r, options, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS)
+		recordResponsesUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
 		reportChatPool(r, options, opened.AccountID, ok, err, status)
 		return
 	}
@@ -1011,11 +1014,11 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		defer releaseServerPick(options, result.AccountID)
 	}
 	if err != nil {
-		recordResponsesUsage(r, options, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0)
+		recordResponsesUsage(r, options, apiKey, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0, raw)
 		writeOpenAIError(w, http.StatusBadGateway, err.Error(), "server_error")
 		return
 	}
-	recordResponsesUsage(r, options, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0)
+	recordResponsesUsage(r, options, apiKey, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
 	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK)
 	content, reasoning, _, _, toolCalls := anthropicCompletionParts(result.Payload)
 	setProtocolObservationHeaders(w, protocolObservation{
@@ -1144,9 +1147,13 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, errorType stri
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": errorType}})
 }
 
-func recordResponsesUsage(r *http.Request, options Options, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int) {
+func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
 	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usage)
 	streamValue := stream
+	var apiKeyID string
+	if apiKey != nil {
+		apiKeyID = apiKey.ID
+	}
 	var errText string
 	if cause != nil {
 		errText = cause.Error()
@@ -1157,6 +1164,15 @@ func recordResponsesUsage(r *http.Request, options Options, accountID, model str
 		v := ttftMS
 		ttftPtr = &v
 	}
+	detail := map[string]any{"route": "go_responses"}
+	if effort := extractReasoningEffort(requestBody); effort != "" {
+		detail["reasoning_effort"] = effort
+		detail["thinking_intensity"] = effort
+	}
+	if ttftMS > 0 {
+		detail["ttft_ms"] = ttftMS
+	}
+	detail["latency_ms"] = latency
 	// Fire-and-forget with longer timeout - usage recording should not block response
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1165,6 +1181,7 @@ func recordResponsesUsage(r *http.Request, options Options, accountID, model str
 			_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
 				RequestID:           requestID(r),
 				Implementation:      "go",
+				APIKeyID:            apiKeyID,
 				AccountID:           accountID,
 				Model:               model,
 				Protocol:            "openai_responses",
@@ -1183,10 +1200,10 @@ func recordResponsesUsage(r *http.Request, options Options, accountID, model str
 				LatencyMS:           &latency,
 				TTFTMS:              ttftPtr,
 				Error:               errText,
-				Detail:              map[string]any{"route": "go_responses"},
+				Detail:              detail,
 			})
 		}
-		recordRedisUsage(options, "", accountID, model, prompt, completion, total, ok)
+		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
 	}()
 }
 
@@ -1531,7 +1548,7 @@ func (p *disconnectProbe) check(ctx context.Context) bool {
 	}
 }
 
-func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int) {
+func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
 	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usage)
 	streamValue := stream
 	var apiKeyID string
@@ -1575,7 +1592,7 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 				LatencyMS:           &latency,
 				TTFTMS:              ttftPtr,
 				Error:               errText,
-				Detail:              map[string]any{"route": "go_messages"},
+				Detail:              usageDetail("go_messages", requestBody, ttftMS, latency),
 			})
 		}
 		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
@@ -3496,6 +3513,127 @@ func ensureLocalModelExtras(items []map[string]any, defaultModel string) []map[s
 		have[id] = true
 	}
 	return items
+}
+
+func usageDetail(route string, requestBody map[string]any, ttftMS, latency int) map[string]any {
+	detail := map[string]any{"route": route, "latency_ms": latency}
+	if ttftMS > 0 {
+		detail["ttft_ms"] = ttftMS
+	}
+	if effort := extractReasoningEffort(requestBody); effort != "" {
+		detail["reasoning_effort"] = effort
+		detail["thinking_intensity"] = effort
+	}
+	return detail
+}
+
+// extractReasoningEffort normalizes client thinking intensity to low/medium/high/xhigh.
+func extractReasoningEffort(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	for _, key := range []string{"reasoning_effort", "thinking_effort", "effort", "thinking_intensity"} {
+		if v, ok := payload[key]; ok && v != nil {
+			if got := normalizeReasoningEffort(v); got != "" {
+				return got
+			}
+		}
+	}
+	if v, ok := payload["reasoning"]; ok && v != nil {
+		if got := normalizeReasoningEffort(v); got != "" {
+			return got
+		}
+	}
+	if v, ok := payload["thinking"]; ok && v != nil {
+		if got := normalizeReasoningEffort(v); got != "" {
+			return got
+		}
+	}
+	// Responses API sometimes nests under text/reasoning configs.
+	if raw, ok := payload["text"].(map[string]any); ok {
+		if got := extractReasoningEffort(raw); got != "" {
+			return got
+		}
+	}
+	return ""
+}
+
+func normalizeReasoningEffort(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case bool:
+		if v {
+			return "medium"
+		}
+		return ""
+	case float64:
+		return budgetToEffort(int(v))
+	case float32:
+		return budgetToEffort(int(v))
+	case int:
+		return budgetToEffort(v)
+	case int64:
+		return budgetToEffort(int(v))
+	case json.Number:
+		n, _ := v.Int64()
+		return budgetToEffort(int(n))
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		if s == "" || s == "none" || s == "null" || s == "false" || s == "off" || s == "disabled" {
+			return ""
+		}
+		aliases := map[string]string{
+			"minimal": "low", "min": "low", "l": "low",
+			"m": "medium", "med": "medium", "enabled": "medium", "adaptive": "medium", "true": "medium", "on": "medium",
+			"h":   "high",
+			"max": "xhigh", "maximum": "xhigh", "ultra": "xhigh", "extra_high": "xhigh", "extrahigh": "xhigh",
+		}
+		if a, ok := aliases[s]; ok {
+			return a
+		}
+		if s == "low" || s == "medium" || s == "high" || s == "xhigh" {
+			return s
+		}
+		if len(s) > 32 {
+			s = s[:32]
+		}
+		return s
+	case map[string]any:
+		for _, key := range []string{"effort", "reasoning_effort", "thinking_effort", "intensity", "level"} {
+			if vv, ok := v[key]; ok && vv != nil {
+				if got := normalizeReasoningEffort(vv); got != "" {
+					return got
+				}
+			}
+		}
+		if vv, ok := v["budget_tokens"]; ok && vv != nil {
+			return normalizeReasoningEffort(vv)
+		}
+		tt := strings.ToLower(strings.TrimSpace(fmt.Sprint(v["type"])))
+		if v["enabled"] == true || tt == "enabled" || tt == "adaptive" {
+			return "medium"
+		}
+		return ""
+	default:
+		return normalizeReasoningEffort(fmt.Sprint(v))
+	}
+}
+
+func budgetToEffort(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n <= 4096 {
+		return "low"
+	}
+	if n <= 16000 {
+		return "medium"
+	}
+	if n <= 48000 {
+		return "high"
+	}
+	return "xhigh"
 }
 
 func firstNonEmptyStr(values ...string) string {
