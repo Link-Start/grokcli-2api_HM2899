@@ -32,6 +32,12 @@ type Event struct {
 	Done bool
 }
 
+// SSE scan constants (package-level to avoid per-call []byte("data:") allocs).
+var (
+	dataPrefix = []byte("data:")
+	doneMarker = []byte("[DONE]")
+)
+
 type UpstreamError struct {
 	Status     int
 	Body       string
@@ -192,29 +198,54 @@ func extractConvID(body map[string]any) string {
 
 func ReadSSE(reader io.Reader, emit func(Event) error) error {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64<<10), 4<<20)
-	var data []string
+	// Dense thinking / multi-tool turns produce large SSE lines (tool args).
+	// 128KiB initial / 8MiB max reduces re-allocation on long payloads.
+	scanner.Buffer(make([]byte, 128<<10), 8<<20)
+
+	// Common case: one "data: {...}" line per event. Avoid strings.Join + Text()
+	// by scanning bytes and copying only the payload we keep until flush.
+	var parts [][]byte
 	flush := func() error {
-		if len(data) == 0 {
+		if len(parts) == 0 {
 			return nil
 		}
-		joined := strings.Join(data, "\n")
-		data = data[:0]
-		if joined == "[DONE]" {
+		var joined []byte
+		if len(parts) == 1 {
+			joined = parts[0]
+		} else {
+			n := 0
+			for _, p := range parts {
+				n += len(p) + 1
+			}
+			joined = make([]byte, 0, n-1)
+			for i, p := range parts {
+				if i > 0 {
+					joined = append(joined, '\n')
+				}
+				joined = append(joined, p...)
+			}
+		}
+		parts = parts[:0]
+		if bytes.Equal(joined, doneMarker) {
 			return emit(Event{Done: true})
 		}
-		return emit(Event{Data: []byte(joined)})
+		return emit(Event{Data: joined})
 	}
+
 	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
+		line := scanner.Bytes()
+		if len(line) == 0 {
 			if err := flush(); err != nil {
 				return err
 			}
 			continue
 		}
-		if strings.HasPrefix(line, "data:") {
-			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		if bytes.HasPrefix(line, dataPrefix) {
+			payload := bytes.TrimSpace(line[len(dataPrefix):])
+			// Copy: scanner.Bytes() is invalidated by the next Scan.
+			cp := make([]byte, len(payload))
+			copy(cp, payload)
+			parts = append(parts, cp)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -245,7 +276,7 @@ func ReadSSEWithIdle(reader io.Reader, idle time.Duration, emit func(Event) erro
 		err   error
 		done  bool
 	}
-	ch := make(chan result, 8)
+	ch := make(chan result, 32)
 	go func() {
 		err := ReadSSE(reader, func(event Event) error {
 			ch <- result{event: event}

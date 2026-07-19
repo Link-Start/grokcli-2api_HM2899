@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -22,6 +23,10 @@ type liveTool struct {
 	itemID    string
 	output    int
 	emitted   bool
+	// clientAcked is true only after the full function_call group was written.
+	// Soft write failures leave emitted=true but unacked so RequeueUnackedTools
+	// can re-emit a complete added+delta+done cluster ("Tool use interrupted").
+	clientAcked bool
 }
 
 // LiveStreamer emits a valid Responses envelope with monotonic sequence
@@ -46,6 +51,12 @@ type LiveStreamer struct {
 	textOut       int // output_index of the open text message item (-1 if none)
 	tools         map[int]*liveTool
 	shellArgKeys  map[string]string
+	// pendingClientAcks: tool indexes framed but not yet Ack'd as written.
+	pendingClientAcks []int
+	// pendingTerminal: Complete frames produced but not yet AckTerminal'd.
+	pendingTerminal bool
+	// terminalEmitted: Complete was successfully written (AckTerminal).
+	terminalEmitted bool
 }
 
 func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
@@ -268,10 +279,54 @@ func (s *LiveStreamer) emitReadyTools(force bool) []string {
 		if force {
 			// Force-finish: recover trailing junk / mild truncation so intermittent
 			// incomplete tools still emit instead of vanishing at stream end.
+			// Prefer emitting a best-effort complete tool over dropping it — a drop
+			// after content_block_start / function_call in_progress is what clients
+			// report as "Tool use interrupted".
 			state.arguments = toolcall.CoerceCompleteJSON(state.arguments, state.name)
 			if !toolcall.CompleteJSON(state.arguments, state.name) {
-				// Skip incomplete tools (do not block later indexes).
-				continue
+				// Retry under common shell/edit aliases before giving up.
+				retryOK := false
+				for _, alt := range []string{"shell", "exec_command", "Edit", "apply_patch"} {
+					if alt == state.name {
+						continue
+					}
+					if c := toolcall.CoerceCompleteJSON(state.arguments, alt); toolcall.CompleteJSON(c, alt) {
+						// Keep original name for client schema projection; args are usable.
+						state.arguments = c
+						retryOK = true
+						break
+					}
+					if c := toolcall.CoerceCompleteJSON(state.arguments, alt); toolcall.CompleteJSON(c, state.name) {
+						state.arguments = c
+						retryOK = true
+						break
+					}
+				}
+				if !retryOK {
+					// Last resort: if Coerce returned any object-looking JSON, emit it.
+					// Better a slightly soft payload than a vanished tool mid-turn.
+					args := strings.TrimSpace(state.arguments)
+					if args == "" || (args[0] != '{' && args[0] != '[') {
+						continue
+					}
+					var raw any
+					if json.Unmarshal([]byte(args), &raw) != nil {
+						continue
+					}
+					// Accept non-empty object/array as emit-able force-finish salvage.
+					switch v := raw.(type) {
+					case map[string]any:
+						if len(v) == 0 {
+							continue
+						}
+					case []any:
+						if len(v) == 0 {
+							continue
+						}
+					default:
+						continue
+					}
+				}
 			}
 		} else {
 			// Live path: normalize only; CompleteJSONStrict rejects truncation
@@ -293,9 +348,11 @@ func (s *LiveStreamer) emitReadyTools(force bool) []string {
 			frames = append(frames, s.closeReasoning()...)
 		}
 		state.emitted = true
+		state.clientAcked = false
 		s.toolsStarted++
 		state.output = s.output
 		state.itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+		s.pendingClientAcks = append(s.pendingClientAcks, index)
 		// Project to the client's shell schema key (Codex: "cmd"; OpenAI: "command").
 		clientArgs := s.projectArgs(state.name, state.arguments)
 		state.arguments = clientArgs
@@ -399,12 +456,269 @@ func hasNonStartPayload(frames []string) bool {
 	return false
 }
 
+// HasUnackedTools reports tools framed but not yet client-Ack'd, or pending terminal.
+// Prefer live tool.clientAcked over pendingClientAcks — the list can lag if a caller
+// acked via tool state (or AckToolsInPayload partially cleared). Stale pending
+// entries must not keep ClientDeliveryOK false after real acks.
+func (s *LiveStreamer) HasUnackedTools() bool {
+	if s == nil {
+		return false
+	}
+	if s.pendingTerminal {
+		return true
+	}
+	for _, state := range s.tools {
+		if state != nil && state.emitted && !state.clientAcked {
+			return true
+		}
+	}
+	for _, idx := range s.pendingClientAcks {
+		state := s.tools[idx]
+		if state == nil {
+			return true
+		}
+		if state.emitted && !state.clientAcked {
+			return true
+		}
+	}
+	return false
+}
+
+// TerminalDelivered is true after response.completed was Ack'd.
+func (s *LiveStreamer) TerminalDelivered() bool {
+	return s != nil && s.terminalEmitted
+}
+
+// ClientDeliveryOK reports a fully closed Responses turn safe for ok=true:
+//   - terminal (response.completed) must be Ack'd, AND
+//   - either text/reasoning was framed, or at least one tool was client-Ack'd.
+//
+// Tools that were only framed (emitted) but never Ack'd do NOT count — that is
+// the half-open function_call path Claude Code calls "Tool use interrupted".
+// Pending incomplete tools that never emitted do not poison a text delivery.
+func (s *LiveStreamer) ClientDeliveryOK() bool {
+	if s == nil || !s.terminalEmitted {
+		return false
+	}
+	if s.HasUnackedTools() {
+		return false
+	}
+	if s.text != "" || s.reasoning != "" {
+		return true
+	}
+	anyEmitted := false
+	anyAcked := false
+	for _, state := range s.tools {
+		if state == nil {
+			continue
+		}
+		// Only emitted/acked tools matter. name-only pending tools were never
+		// framed; force-finish drop is empty, not half-open.
+		if state.emitted || state.clientAcked {
+			anyEmitted = true
+		}
+		if state.clientAcked {
+			anyAcked = true
+		}
+	}
+	if anyEmitted {
+		return anyAcked
+	}
+	// Envelope-only / empty: not OK.
+	return false
+}
+
+// UndeliveredTools is true when any tool was framed but never client-Ack'd.
+func (s *LiveStreamer) UndeliveredTools() bool {
+	if s == nil {
+		return false
+	}
+	for _, state := range s.tools {
+		if state != nil && state.emitted && !state.clientAcked {
+			return true
+		}
+	}
+	for _, idx := range s.pendingClientAcks {
+		state := s.tools[idx]
+		if state == nil {
+			return true
+		}
+		if state.emitted && !state.clientAcked {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsFinishRetry is true when soft-fail recovery still has work.
+// Incomplete pending tools must not loop Complete after terminal — that re-emits
+// response.completed and surfaces as Claude Code "Tool use interrupted".
+func (s *LiveStreamer) NeedsFinishRetry() bool {
+	if s == nil {
+		return false
+	}
+	if s.HasUnackedTools() {
+		return true
+	}
+	if !s.terminalEmitted {
+		return s.HasPendingTools() || s.HasClientPayload() || s.started
+	}
+	// Terminal landed: only retry ready-to-emit tools (soft-fail requeue).
+	return s.hasReadyUnemittedTools()
+}
+
+// hasReadyUnemittedTools reports a non-emitted tool that force-finish can still emit.
+func (s *LiveStreamer) hasReadyUnemittedTools() bool {
+	if s == nil {
+		return false
+	}
+	for _, state := range s.tools {
+		if state == nil || state.emitted || state.clientAcked {
+			continue
+		}
+		if state.name == "" {
+			continue
+		}
+		args := toolcall.CoerceCompleteJSON(state.arguments, state.name)
+		if toolcall.CompleteJSON(args, state.name) {
+			return true
+		}
+	}
+	return false
+}
+
+// AckToolsInPayload marks tools whose item id / call_id appears in a successful write.
+func (s *LiveStreamer) AckToolsInPayload(payload string) {
+	if s == nil || payload == "" {
+		return
+	}
+	if !strings.Contains(payload, "function_call") {
+		return
+	}
+	acked := make(map[int]bool)
+	for index, state := range s.tools {
+		if state == nil || state.clientAcked || !state.emitted {
+			continue
+		}
+		matched := false
+		if state.itemID != "" && strings.Contains(payload, state.itemID) {
+			matched = true
+		} else if state.id != "" && strings.Contains(payload, state.id) {
+			matched = true
+		}
+		if !matched {
+			continue
+		}
+		state.clientAcked = true
+		acked[index] = true
+	}
+	if len(acked) == 0 {
+		return
+	}
+	if len(s.pendingClientAcks) == 0 {
+		return
+	}
+	kept := s.pendingClientAcks[:0]
+	for _, idx := range s.pendingClientAcks {
+		if !acked[idx] {
+			kept = append(kept, idx)
+		}
+	}
+	s.pendingClientAcks = kept
+}
+
+// AckTerminal marks a successfully written response.completed/[DONE] batch.
+func (s *LiveStreamer) AckTerminal() {
+	if s == nil || !s.pendingTerminal {
+		return
+	}
+	s.terminalEmitted = true
+	s.pendingTerminal = false
+}
+
+// UnackTerminal rolls back a previously Ack'd terminal so Complete can re-emit
+// response.completed AFTER any requeued tools. Emitting function_call groups
+// after completed/[DONE] is what Claude Code reports as "Tool use interrupted".
+func (s *LiveStreamer) UnackTerminal() {
+	if s == nil {
+		return
+	}
+	s.terminalEmitted = false
+	s.pendingTerminal = false
+	s.closed = false
+}
+
+// AckEmittedTools marks all pending tools + terminal as written (full-batch success).
+func (s *LiveStreamer) AckEmittedTools() {
+	if s == nil {
+		return
+	}
+	s.AckTerminal()
+	for _, idx := range s.pendingClientAcks {
+		if state := s.tools[idx]; state != nil {
+			state.clientAcked = true
+		}
+	}
+	s.pendingClientAcks = s.pendingClientAcks[:0]
+	for _, state := range s.tools {
+		if state != nil && state.emitted {
+			state.clientAcked = true
+		}
+	}
+}
+
+// RequeueUnackedTools rolls back tools that were framed but never acked so
+// Complete/emitReadyTools can re-emit a complete function_call group.
+//
+// If any tool is requeued while terminal was already Ack'd, also UnackTerminal:
+// Claude Code / Codex reject function_call after response.completed ("Tool use
+// interrupted"). Recovery must re-emit tools THEN completed in one turn.
+func (s *LiveStreamer) RequeueUnackedTools() {
+	if s == nil {
+		return
+	}
+	if s.pendingTerminal && !s.terminalEmitted {
+		s.pendingTerminal = false
+		// Allow Complete to re-emit response.completed.
+		s.closed = false
+	}
+	requeuedTool := false
+	for _, state := range s.tools {
+		if state == nil || state.clientAcked || !state.emitted {
+			continue
+		}
+		// Roll back so emitReadyTools can re-frame. Keep args/name/id.
+		state.emitted = false
+		state.itemID = ""
+		state.output = -1
+		if s.toolsStarted > 0 {
+			s.toolsStarted--
+		}
+		requeuedTool = true
+	}
+	s.pendingClientAcks = s.pendingClientAcks[:0]
+	// Never leave tools to re-emit after a delivered completed envelope.
+	if requeuedTool && s.terminalEmitted {
+		s.UnackTerminal()
+	}
+}
+
 func (s *LiveStreamer) Complete(usage *Usage) []string {
+	// Soft write may have left unacked tools/terminal; requeue before force-finish.
+	s.RequeueUnackedTools()
 	// Preserve empty-stream contract used by callers: if we never opened any client
 	// payload AND never started the envelope, emit nothing so Fail can still run.
-	if s.closed {
+	if s.closed && s.terminalEmitted && !s.HasPendingTools() && !s.HasUnackedTools() {
 		return nil
 	}
+	// Allow Complete recovery after soft-fail: reopen if terminal never Ack'd.
+	if s.closed && !s.terminalEmitted {
+		s.closed = false
+	}
+	// Terminal already Ack'd with nothing left to re-emit: toolsOnly would skip
+	// completed. RequeueUnackedTools clears terminalEmitted whenever tools need
+	// re-emit, so toolsOnly is only true when tools are done and terminal landed.
+	toolsOnly := s.terminalEmitted && !s.HasPendingTools()
 	if !s.started && !s.HasClientPayload() {
 		return nil
 	}
@@ -470,11 +784,18 @@ func (s *LiveStreamer) Complete(usage *Usage) []string {
 		// in SSE but disappears from the final response object).
 		"output": s.snapshotOutput(),
 	}
+	if toolsOnly {
+		// Tools re-emit after prior Ack'd completed; do not duplicate terminal.
+		return frames
+	}
 	frames = append(frames,
 		s.sequence.Event("response.completed", map[string]any{"response": completed}),
 		"data: [DONE]\n\n",
 	)
+	// Mark closed for mid-stream Feed rejection; pendingTerminal allows re-emit
+	// via Requeue+Complete if the write soft-fails before AckTerminal.
 	s.closed = true
+	s.pendingTerminal = true
 	return frames
 }
 

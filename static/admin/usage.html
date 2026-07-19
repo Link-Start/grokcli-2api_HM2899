@@ -147,7 +147,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>用量概览</h3>
-      <p>代理侧统计：成功请求的输入 / 输出 token；失败只计请求数。数据来自 Redis 热桶 + PostgreSQL 日汇总。缓存命中率来自请求明细（cache_read / prompt）。</p>
+      <p>代理侧统计：成功请求的<strong>计费 token = total − cache_read</strong>（已扣缓存命中）；失败只计请求数。累计数字带 k/M/B 单位。缓存命中率 = cache_read / prompt。</p>
     </div>
     <div class="g2a-actions">
       <div class="g2a-field" style="min-width:120px;margin:0">
@@ -170,7 +170,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>按日趋势</h3>
-      <p>每日 total tokens（柱高）与请求数。</p>
+      <p>每日<strong>计费</strong> tokens（柱高，已扣缓存）与请求数。</p>
     </div>
   </div>
   <div id="usage-series" class="g2a-usage-bars" style="min-height:120px">—</div>
@@ -301,7 +301,7 @@
           <th>模型</th>
           <th style="width:100px">输入 token</th>
           <th style="width:100px">输出 token</th>
-          <th style="width:100px">合计 token</th>
+          <th style="width:100px">计费 token</th>
           <th style="width:100px">缓存 token</th>
           <th style="width:100px">推理 token</th>
           <th style="width:100px" title="reasoning_effort / thinking · low · medium · high · xhigh">思考强度</th>
@@ -327,9 +327,9 @@
     </div>
   </div>
   <script src="/static/dist/utils.360f09cd20.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/api.4fde34e0be.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.fdbd666ef4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.6c83eeb57d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

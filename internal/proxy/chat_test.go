@@ -817,3 +817,46 @@ func TestChatToolAssemblerFeedFinishThenSoftDisconnect(t *testing.T) {
 		t.Fatalf("unexpected second terminal %#v", term)
 	}
 }
+
+func TestChatToolAssemblerSoftWriteRequeue(t *testing.T) {
+	a := NewChatToolStreamAssembler()
+	a.SetAllowedTools([]string{"Edit"})
+	raw := []byte(`{"id":"c1","model":"g","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Edit","arguments":"{\"file_path\":\"/x\",\"old_string\":\"a\",\"new_string\":\"b\"}"}}]},"finish_reason":null}]}`)
+	delta, err := ParseChatDelta(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, passthrough := a.Feed(raw, delta)
+	if passthrough {
+		t.Fatal("expected non-passthrough tool frames")
+	}
+	if len(frames) == 0 {
+		t.Fatal("expected emitted tool frames")
+	}
+	// Soft write: not Ack'd
+	if !a.HasUnacked() {
+		t.Fatal("expected unacked after emit without Ack")
+	}
+	a.RequeueUnacked()
+	// Finish should re-emit
+	again := a.Finish()
+	if len(again) == 0 {
+		t.Fatal("Finish after requeue must re-emit tool frames")
+	}
+	// Ack success
+	encoded, _ := json.Marshal(again[0])
+	a.AckPayload(string(encoded))
+	// FinishReason + Ack
+	term := a.FinishReasonFrame()
+	if term == nil {
+		t.Fatal("expected finish_reason frame")
+	}
+	termEnc, _ := json.Marshal(term)
+	a.AckPayload(string(termEnc))
+	if a.NeedsFinishRetry() {
+		t.Fatal("no retry after full Ack")
+	}
+	if second := a.FinishReasonFrame(); second != nil {
+		t.Fatalf("idempotent FinishReasonFrame, got %#v", second)
+	}
+}

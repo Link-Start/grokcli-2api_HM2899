@@ -2,7 +2,7 @@ package responses
 
 import (
 	"encoding/json"
-	"fmt"
+	"strings"
 )
 
 type Usage struct {
@@ -58,9 +58,16 @@ func (s *Sequence) Event(name string, payload map[string]any) string {
 	body["sequence_number"] = s.next
 	s.next++
 	encoded, _ := json.Marshal(body)
-	return fmt.Sprintf("event: %s\ndata: %s\n\n", name, encoded)
+	// Hot path: avoid fmt.Sprintf (extra parse + alloc) on every SSE frame.
+	var b strings.Builder
+	b.Grow(16 + len(name) + len(encoded))
+	b.WriteString("event: ")
+	b.WriteString(name)
+	b.WriteString("\ndata: ")
+	b.Write(encoded)
+	b.WriteString("\n\n")
+	return b.String()
 }
-
 func Failure(responseID, model, message, errorType string) []string {
 	if errorType == "" {
 		errorType = "server_error"

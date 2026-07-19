@@ -58,14 +58,21 @@ window.G2A = window.G2A || {};
 
   function _apiHtmlError(path, status, text) {
     const sample = String(text || "").replace(/\s+/g, " ").trim().slice(0, 180);
-    const err = new Error(
+    let hint =
       "Admin API 返回了 HTML 页面，通常是反向代理或部署子路径没有把 " +
-      API_BASE + path + " 转发到后端。请检查 /admin/api 路由。" +
-      (sample ? " 响应片段：" + sample : "")
-    );
+      API_BASE + path + " 转发到后端。请检查 /admin/api 路由。";
+    // Cloudflare / nginx gateway HTML on 502/504 is the common auto-refresh failure mode
+    // when /admin/api/status was too slow (heavy usage scan) or the upstream was restarting.
+    if (status === 502 || status === 504 || status === 503) {
+      hint =
+        "网关 " + status + "：反代连不上后端或上游超时（常见于 /admin/api/status 过重/重启）。" +
+        "请确认 grokcli-2api 健康，并把 /admin/api/* 反代到应用端口（勿落到静态站）。";
+    }
+    const err = new Error(hint + (sample ? " 响应片段：" + sample : ""));
     err.status = status;
     err.path = path;
     err.html = true;
+    err.gateway = status === 502 || status === 503 || status === 504;
     err.detail = sample;
     return err;
   }

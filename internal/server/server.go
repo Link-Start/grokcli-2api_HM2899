@@ -87,10 +87,57 @@ func (o Options) runtimeConfig() config.Config {
 }
 
 func (o Options) applySettingsToRuntime(settings map[string]any) {
-	if o.RuntimeConfig == nil || settings == nil {
+	if settings == nil {
 		return
 	}
-	o.RuntimeConfig.ApplyStoreSettings(settings)
+	if o.RuntimeConfig != nil {
+		o.RuntimeConfig.ApplyStoreSettings(settings)
+	}
+	// History compact knobs live in historycompact package (not Config struct).
+	applyHistoryCompactSettings(settings)
+}
+
+func applyHistoryCompactSettings(settings map[string]any) {
+	if settings == nil {
+		return
+	}
+	opts := historycompact.ConfigureOpts{}
+	if v, ok := settings["history_compact_enabled"].(bool); ok {
+		opts.Enabled = &v
+	}
+	if n, ok := asSettingsIntLocal(settings["history_compact_auto_chars"]); ok {
+		opts.AutoChars = &n
+	}
+	if n, ok := asSettingsIntLocal(settings["history_keep_tool_rounds"]); ok {
+		opts.KeepToolRounds = &n
+	}
+	if n, ok := asSettingsIntLocal(settings["history_max_tool_result_chars"]); ok {
+		opts.MaxToolResultChars = &n
+	}
+	if opts.Enabled != nil || opts.AutoChars != nil || opts.KeepToolRounds != nil || opts.MaxToolResultChars != nil {
+		historycompact.ConfigureFull(opts)
+	}
+}
+
+func asSettingsIntLocal(value any) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		return int(v), true
+	case float32:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case json.Number:
+		i, err := v.Int64()
+		return int(i), err == nil
+	case string:
+		i, err := strconv.Atoi(strings.TrimSpace(v))
+		return i, err == nil
+	default:
+		return 0, false
+	}
 }
 
 // NewMigrationMux exposes migration-safe process probes plus low-risk read-only
@@ -151,6 +198,7 @@ func NewMux(options Options) http.Handler {
 		_, _ = w.Write([]byte("# HELP g2a_runtime_ready Go runtime readiness gate.\n"))
 		_, _ = w.Write([]byte("# TYPE g2a_runtime_ready gauge\n"))
 		_, _ = w.Write([]byte("g2a_runtime_ready{implementation=\"go\"} " + itoa(ready) + "\n"))
+		_, _ = w.Write([]byte(streamMetricsPrometheus()))
 	})
 	// Exact root only. A bare "GET /" is a subtree pattern in Go 1.22+ and would
 	// incorrectly serve index.html for every unmatched path (e.g. /unknown).
@@ -533,6 +581,8 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
+	chatReq.UserAgent = r.UserAgent()
+
 	// Codex shell schema uses "cmd"; remember preferred keys from the client tools
 	// so outbound tool_calls project command→cmd (or honor pure command-only schemas).
 	keys := toolcall.ShellArgKeyMap(chatReq.Raw["tools"])
@@ -540,8 +590,9 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 	if keys == nil {
 		keys = map[string]string{}
 	}
-	if len(keys) == 0 && (historycompact.IsCodexClient(r.UserAgent()) || historycompact.IsOpenAINativeClient(r.UserAgent())) {
-		for _, name := range []string{"exec_command", "run_command", "shell", "bash", "local_shell", "shell_command"} {
+	// Proxies often strip User-Agent — also detect Codex via tools schema (exec_command/cmd).
+	if len(keys) == 0 && historycompact.LooksLikeCodexRequest(r.UserAgent(), chatReq.Raw["tools"], chatReq.Raw) {
+		for _, name := range []string{"exec_command", "run_command", "shell", "bash", "local_shell", "shell_command", "Shell", "Bash", "localShell"} {
 			keys[name] = "cmd"
 			keys[strings.ToLower(name)] = "cmd"
 			if nk := toolcall.NameKey(name); nk != "" {
@@ -727,70 +778,148 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 	assembler.SetShellArgKeys(shellArgKeysFrom(r.Context()))
 	// Remap Grok Update/StrReplace → client Edit when tools are known.
 	assembler.SetAllowedTools(allowedToolNamesFrom(r.Context()))
-	write := func(data []byte, force bool) error {
-		if !force {
-			select {
-			case <-r.Context().Done():
-				return r.Context().Err()
-			default:
-			}
+	// Soft client write/ctx blips must NOT abort ReadSSE: aborting drains the
+	// remaining upstream tool-arg frames, force-finishes with half args, and
+	// Claude Code surfaces that as intermittent "Tool use interrupted".
+	sw := newSSEWriter(w, flusher, r.Context())
+	// Coalesce pure text/reasoning passthrough frames to cut Flush storms.
+	pending := make([]byte, 0, 1024)
+	firstPayloadFlushed := false
+	flushPending := func(force bool) error {
+		if len(pending) == 0 {
+			return nil
 		}
-		if _, err := w.Write(data); err != nil {
+		payload := pending
+		pending = pending[:0]
+		streamCoalesceFlush.Add(1)
+		if err := sw.WriteBytes(payload, force || sw.SoftGone()); err != nil {
 			return err
 		}
-		flusher.Flush()
+		if sw.LastOK() {
+			firstPayloadFlushed = true
+		}
 		return nil
 	}
 	writeJSONFrame := func(payload map[string]any, force bool) error {
+		if err := flushPending(true); err != nil {
+			return err
+		}
 		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return err
 		}
-		return write(append(append([]byte("data: "), encoded...), '\n', '\n'), force)
+		frame := make([]byte, 0, len(encoded)+8)
+		frame = append(frame, "data: "...)
+		frame = append(frame, encoded...)
+		frame = append(frame, '\n', '\n')
+		if err := sw.WriteBytes(frame, force); err != nil {
+			return err
+		}
+		if sw.LastOK() {
+			assembler.AckPayload(string(encoded))
+		} else if assembler.HasUnacked() {
+			assembler.RequeueUnacked()
+		}
+		return nil
 	}
-	clientSoftGone := false
 	terminalFlushed := false
+	// Real model payload only (text/reasoning/tools). Role-only / empty / usage-only
+	// SSE must NOT count — that was an intermittent "soft-success empty" path when
+	// upstream dropped after hollow frames (FirstTokenMS>0 with no client content).
+	sawRealPayload := false
+	sawFinishReason := false
+	streamID := ""
+	streamModel := ""
 	flushAssemblerTerminal := func() error {
-		if terminalFlushed {
+		_ = flushPending(true)
+		if terminalFlushed && !assembler.NeedsFinishRetry() {
 			return nil
 		}
-		terminalFlushed = true
 		// End-of-stream / soft disconnect: force-finish incomplete tools and always
-		// emit a finish_reason frame so clients do not hang as "Tool use interrupted".
-		for _, frame := range assembler.Finish() {
-			if err := writeJSONFrame(frame, true); err != nil {
-				return err
+		// emit a finish_reason frame so clients do not hang as "Tool use interrupted"
+		// or incomplete mid-response (text-only turns included).
+		for attempt := 0; attempt < 5; attempt++ {
+			terminalFlushed = true
+			for _, frame := range assembler.Finish() {
+				if err := writeJSONFrame(frame, true); err != nil {
+					return err
+				}
+			}
+			if frame := assembler.FinishReasonFrame(); frame != nil {
+				if err := writeJSONFrame(frame, true); err != nil {
+					return err
+				}
+				sawFinishReason = true
+			} else if !sawFinishReason {
+				// Text-only soft terminal (or tools all dropped): still emit finish_reason
+				// so OpenAI clients / Claude Code leave "running" cleanly.
+				id := streamID
+				if id == "" {
+					id = "chatcmpl-go-stream"
+				}
+				model := streamModel
+				if model == "" {
+					model = "grok-4.5"
+				}
+				term := map[string]any{
+					"id":      id,
+					"object":  "chat.completion.chunk",
+					"created": time.Now().Unix(),
+					"model":   model,
+					"choices": []any{
+						map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"},
+					},
+				}
+				if err := writeJSONFrame(term, true); err != nil {
+					return err
+				}
+				sawFinishReason = true
+			}
+			if !assembler.NeedsFinishRetry() {
+				break
 			}
 		}
-		if frame := assembler.FinishReasonFrame(); frame != nil {
-			if err := writeJSONFrame(frame, true); err != nil {
-				return err
-			}
-		}
-		return write([]byte("data: [DONE]\n\n"), true)
+		return sw.WriteBytes([]byte("data: [DONE]\n\n"), true)
 	}
 	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
 		if event.Done {
 			return flushAssemblerTerminal()
 		}
-		if stats.FirstTokenMS == 0 && len(event.Data) > 0 {
-			stats.FirstTokenMS = int(time.Since(started).Milliseconds())
-			if stats.FirstTokenMS <= 0 {
-				stats.FirstTokenMS = 1
-			}
-		}
 		delta, err := proxy.ParseChatDelta(event.Data)
 		if err == nil && delta.Usage != nil {
 			stats.Usage = delta.Usage
 		}
+		if err == nil {
+			if delta.ID != "" {
+				streamID = delta.ID
+			}
+			if delta.Model != "" {
+				streamModel = delta.Model
+			}
+			hasContent := strings.TrimSpace(delta.Content) != "" || strings.TrimSpace(delta.Reasoning) != ""
+			hasTools := len(delta.ToolCalls) > 0 || delta.FunctionCall != nil
+			if hasContent || hasTools {
+				sawRealPayload = true
+				// TTFT = first real model payload, not hollow role/usage SSE.
+				if stats.FirstTokenMS == 0 {
+					stats.FirstTokenMS = int(time.Since(started).Milliseconds())
+					if stats.FirstTokenMS <= 0 {
+						stats.FirstTokenMS = 1
+					}
+				}
+			}
+			if delta.FinishReason != nil {
+				sawFinishReason = true
+			}
+		}
 		// When tool deltas present (or assembler is already buffering tools), rewrite
-		// through assembler; pure text/finish frames passthrough unchanged.
+		// through assembler; pure text/finish frames passthrough with coalesce.
 		if err == nil && (len(delta.ToolCalls) > 0 || delta.FunctionCall != nil || assembler.Holding()) {
 			frames, passthrough := assembler.Feed(event.Data, delta)
 			if !passthrough {
 				// Once tools are in flight, force writes so a soft disconnect still
 				// delivers complete tool_calls + finish_reason rather than half frames.
-				writeForce := assembler.Holding() || assembler.EmittedAny()
+				writeForce := assembler.Holding() || assembler.EmittedAny() || sw.SoftGone()
 				for _, frame := range frames {
 					if err := writeJSONFrame(frame, writeForce); err != nil {
 						return err
@@ -799,24 +928,47 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 				return nil
 			}
 		}
-		data := append([]byte("data: "), event.Data...)
-		data = append(data, '\n', '\n')
-		return write(data, false)
+		// Coalesce pure text passthrough: first token immediate (TTFT), then batch
+		// until textCoalesceMax / tool / idle / finish.
+		frame := make([]byte, 0, len(event.Data)+8)
+		frame = append(frame, "data: "...)
+		frame = append(frame, event.Data...)
+		frame = append(frame, '\n', '\n')
+		// Force first real payload for TTFT; coalesce subsequent pure text.
+		canCoalesce := firstPayloadFlushed && !assembler.Holding() && !assembler.EmittedAny() && !sw.SoftGone()
+		if canCoalesce {
+			pending = append(pending, frame...)
+			if len(pending) >= textCoalesceMax {
+				return flushPending(false)
+			}
+			return nil
+		}
+		if err := flushPending(true); err != nil {
+			return err
+		}
+		if err := sw.WriteBytes(frame, true); err != nil {
+			return err
+		}
+		if sw.LastOK() && sawRealPayload {
+			firstPayloadFlushed = true
+		}
+		return nil
 	}, func() error {
+		_ = flushPending(true)
 		select {
 		case <-r.Context().Done():
-			// Soft disconnect: keep SSE warm; terminal frames still flush after ReadSSE.
-			clientSoftGone = true
-			return write([]byte(": keepalive\n\n"), true)
+			sw.MarkSoftGone()
+			return sw.Keepalive(": keepalive\n\n", DefaultKeepaliveInterval, true)
 		default:
 		}
-		return write([]byte(": keepalive\n\n"), false)
+		return sw.Keepalive(": keepalive\n\n", DefaultKeepaliveInterval, false)
 	})
 	// Soft disconnect / write abort / mid-stream upstream drop after tools or
 	// content started: force-finish so clients do not hang, and avoid a second
 	// error JSON that Claude Code reports as "Server error mid-response".
-	hasStreamPayload := assembler.Holding() || assembler.EmittedAny() || stats.FirstTokenMS > 0
-	clientSoft := clientSoftGone || errors.Is(err, r.Context().Err()) || isSoftClientWriteError(err)
+	_ = flushPending(true)
+	hasStreamPayload := assembler.Holding() || assembler.EmittedAny() || sawRealPayload
+	clientSoft := sw.SoftGone() || errors.Is(err, r.Context().Err()) || isSoftClientWriteError(err)
 	upstreamMid := err != nil && !clientSoft
 	if hasStreamPayload {
 		if err == nil || clientSoft || upstreamMid {
@@ -829,8 +981,8 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 	if err != nil && !errors.Is(err, r.Context().Err()) && !hasStreamPayload {
 		msg, errType := openAIErrorFromCause(err)
 		encoded, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": errType}})
-		_ = write(append(append([]byte("data: "), encoded...), '\n', '\n'), true)
-		_ = write([]byte("data: [DONE]\n\n"), true)
+		_ = sw.WriteBytes(append(append([]byte("data: "), encoded...), '\n', '\n'), true)
+		_ = sw.WriteBytes([]byte("data: [DONE]\n\n"), true)
 	}
 	return stats, err
 }
@@ -1210,7 +1362,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
 	}
 	allowedTools := allowedAnthropicToolNames(body)
-	chatReq := proxy.ChatRequest{Model: model, Stream: false, Raw: body}
+	chatReq := proxy.ChatRequest{Model: model, Stream: false, Raw: body, UserAgent: r.UserAgent()}
 	candidates, err := listCandidatesForRequest(r.Context(), options, chatReq, r.Header)
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, err.Error(), "api_error")
@@ -1270,18 +1422,10 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		if !ok {
 			status = http.StatusBadGateway
 		}
-		// Guard: never record successful zero-token sub-second streams as ok when
-		// no TTFT was observed (classic intermittent empty envelope).
-		if ok && firstTokenMS <= 0 {
-			p, c, tot, _, _, _ := postgres.UsageFromOpenAI(usage)
-			if p == 0 && c == 0 && tot == 0 && time.Since(started) < 3*time.Second {
-				ok = false
-				status = http.StatusBadGateway
-				if err == nil {
-					err = errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
-				}
-			}
-		}
+		// Hollow / half-open tool streams return an empty error from the stream
+		// function (ClientDeliveryOK / HasClientPayload). Do NOT flip ok=false
+		// solely for zero usage tokens — upstream often omits usage on short tool
+		// turns; that would false-fail real deliveries (and mask the real fix).
 		recordAnthropicUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
 		reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
 		return
@@ -1400,7 +1544,15 @@ func clampCodexReasoning(raw, body map[string]any, userAgent string, enabled boo
 	if !enabled || body == nil {
 		return
 	}
-	if !historycompact.IsCodexClient(userAgent) {
+	tools := any(nil)
+	if body != nil {
+		tools = body["tools"]
+	}
+	if tools == nil && raw != nil {
+		tools = raw["tools"]
+	}
+	// Proxies may strip UA; detect Codex via tools schema (exec_command/cmd).
+	if !historycompact.LooksLikeCodexRequest(userAgent, tools, raw) {
 		return
 	}
 	// Force low effort for Codex/OpenAI-native TTFT. Explicit values are overwritten
@@ -1567,17 +1719,23 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	// ensureCodexShellCmdKeys when properties.command is exclusive and no cmd prop.
 	// Do this even without UA detection — many proxies strip User-Agent.
 	keys = ensureCodexShellCmdKeys(raw["tools"], keys)
-	// If client sent no tools list (or empty map) but is Codex, still seed common shell names.
-	if len(keys) == 0 && (historycompact.IsCodexClient(r.UserAgent()) || historycompact.IsOpenAINativeClient(r.UserAgent())) {
-		for _, name := range []string{
-			"shell", "Shell", "bash", "Bash",
-			"local_shell", "localShell", "exec", "run",
-			"exec_command", "exec-command", "ExecCommand",
-			"run_command", "shell_command", "ShellCommand",
-		} {
-			keys[name] = "cmd"
-			keys[strings.ToLower(name)] = "cmd"
-			keys[toolcall.NameKey(name)] = "cmd"
+	// If shell map still empty but request looks like Codex (UA or tools schema), seed common shell names.
+	if len(keys) == 0 {
+		var tools any
+		if raw != nil {
+			tools = raw["tools"]
+		}
+		if historycompact.LooksLikeCodexRequest(r.UserAgent(), tools, raw) {
+			for _, name := range []string{
+				"shell", "Shell", "bash", "Bash",
+				"local_shell", "localShell", "exec", "run",
+				"exec_command", "exec-command", "ExecCommand",
+				"run_command", "shell_command", "ShellCommand",
+			} {
+				keys[name] = "cmd"
+				keys[strings.ToLower(name)] = "cmd"
+				keys[toolcall.NameKey(name)] = "cmd"
+			}
 		}
 	}
 	if len(keys) > 0 {
@@ -1589,7 +1747,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		writeOpenAIError(w, http.StatusBadRequest, "input must contain at least one message", "invalid_request_error")
 		return
 	}
-	chatReq := proxy.ChatRequest{Model: model, Stream: stream, Raw: body}
+	chatReq := proxy.ChatRequest{Model: model, Stream: stream, Raw: body, UserAgent: r.UserAgent()}
 	// Sticky keys for Codex multi-turn: prompt_cache_key first, then previous_response_id chain.
 	// CRITICAL: never mint a *new* pck each turn from previous_response_id — that kills upstream
 	// prompt cache. Always recover the same pck that produced the previous response when possible.
@@ -1722,11 +1880,20 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 			Failover: opened.Failover, Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep,
 		})
 		usage, firstTokenMS, err := streamOpenAIResponsesContinue(w, req, opened.Body, early, effectiveResponsesKeepalive(optionsFromRequest(req).Keepalive, len(allowedResponsesToolNames(body)) > 0), respPolicy.MaxTools)
-		ok := err == nil || errors.Is(err, r.Context().Err())
+		// Client cancel after headers is soft-ok only when the stream function
+		// already soft-closed a real payload (returns nil). Empty/tool-vanished
+		// returns an explicit empty error → not ok.
+		ok := err == nil
+		if !ok && errors.Is(err, r.Context().Err()) {
+			ok = true
+		}
 		status := http.StatusOK
 		if !ok {
 			status = http.StatusBadGateway
 		}
+		// Hollow / half-open function_call streams return empty error from the
+		// stream function (ClientDeliveryOK). Zero usage tokens alone are not a
+		// failure — xAI often omits usage on short tool turns.
 		recordResponsesUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
 		reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
 		return
@@ -1782,9 +1949,7 @@ func responsesKeepaliveFrame() string {
 }
 
 func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reader, responseID, model string, allowed []string, keepalive time.Duration, maxTools int) (map[string]any, int, error) {
-	keepalive = effectiveResponsesKeepalive(keepalive, len(allowed) > 0)
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "streaming is not supported by this response writer"})
 		return nil, 0, errors.New("streaming is not supported by this response writer")
 	}
@@ -1799,156 +1964,7 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 	}
 	streamer := responses.NewLiveStreamerWithMaxTools(responseID, model, allowed, maxTools)
 	streamer.SetShellArgKeys(shellArgKeysFrom(r.Context()))
-	// Early envelope for Codex perceived TTFT even on legacy call path.
-	for _, frame := range streamer.Start() {
-		_, _ = w.Write([]byte(frame))
-	}
-	flusher.Flush()
-	writeFrames := func(frames []string, force bool) error {
-		if len(frames) == 0 {
-			return nil
-		}
-		if !force {
-			select {
-			case <-r.Context().Done():
-				return r.Context().Err()
-			default:
-			}
-		}
-		var buf strings.Builder
-		for _, frame := range frames {
-			buf.WriteString(frame)
-		}
-		_, err := w.Write([]byte(buf.String()))
-		if err != nil {
-			return err
-		}
-		flusher.Flush()
-		return nil
-	}
-	writeFrame := func(frame string, force bool) error {
-		return writeFrames([]string{frame}, force)
-	}
-	toolGap := outboundToolGapFrom(r.Context())
-	toolsEmitted := 0
-	emitFrames := func(frames []string, force bool) error {
-		if len(frames) == 0 {
-			return nil
-		}
-		// Keep each function_call added+delta+done in one Write+Flush so a soft
-		// disconnect cannot leave Codex with an in_progress item and no completed.
-		// toolGap still applies BETWEEN tools (flush previous group first).
-		batch := make([]string, 0, len(frames))
-		flushBatch := func() error {
-			if len(batch) == 0 {
-				return nil
-			}
-			if err := writeFrames(batch, force); err != nil {
-				return err
-			}
-			batch = batch[:0]
-			return nil
-		}
-		for _, frame := range frames {
-			isToolStart := strings.Contains(frame, "function_call") && strings.Contains(frame, "response.output_item.added")
-			if isToolStart {
-				if err := flushBatch(); err != nil {
-					return err
-				}
-				if toolGap > 0 && toolsEmitted > 0 {
-					timer := time.NewTimer(toolGap)
-					select {
-					case <-r.Context().Done():
-						timer.Stop()
-						// Soft disconnect after envelope: skip remaining toolGap and keep
-						// emitting frames so Codex still gets function_call + completed.
-					case <-timer.C:
-					}
-				}
-				toolsEmitted++
-			}
-			batch = append(batch, frame)
-		}
-		return flushBatch()
-	}
-	var usage map[string]any
-	firstTokenMS := 0
-	started := time.Now()
-	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
-		if event.Done {
-			return nil
-		}
-		if firstTokenMS == 0 && len(event.Data) > 0 {
-			firstTokenMS = int(time.Since(started).Milliseconds())
-			if firstTokenMS <= 0 {
-				firstTokenMS = 1
-			}
-		}
-		delta, err := proxy.ParseChatDelta(event.Data)
-		if err != nil {
-			return nil
-		}
-		if raw, ok := delta.Usage.(map[string]any); ok {
-			usage = raw
-		}
-		if err := emitFrames(streamer.Reasoning(delta.Reasoning), true); err != nil {
-			return err
-		}
-		if err := emitFrames(streamer.Text(delta.Content), true); err != nil {
-			return err
-		}
-		if err := emitFrames(streamer.ToolDeltas(responsesToolDeltas(delta)), true); err != nil {
-			return err
-		}
-		// Incomplete tool args are held client-side-silent; force a keepalive so
-		// proxies do not treat the open Responses envelope as idle-disconnect.
-		if streamer.HasPendingTools() {
-			return writeFrame(responsesKeepaliveFrame(), true)
-		}
-		return nil
-	}, func() error {
-		// Soft disconnect probe: if client is gone after envelope open, still
-		// keep writing keepalives until upstream ends so Complete can run.
-		select {
-		case <-r.Context().Done():
-			// Do not abort the stream mid-envelope; let Complete emit terminal frames.
-			return writeFrame(responsesKeepaliveFrame(), true)
-		default:
-		}
-		return writeFrame(responsesKeepaliveFrame(), false)
-	})
-	clientGone := errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
-	hasPayload := streamer.HasClientPayload() || streamer.HasPendingTools()
-	// Upstream mid-stream drop after client already saw content/tools: soft Complete
-	// only. response.failed mid-turn surfaces as Claude/Codex "Server error mid-response".
-	upstreamMidError := err != nil && !clientGone
-	if upstreamMidError && !hasPayload {
-		msg, errType := openAIErrorFromCause(err)
-		_ = emitFrames(streamer.Fail(msg, errType), true)
-		return usage, firstTokenMS, err
-	}
-	respUsage := responsesUsageFromOpenAI(usage)
-	// Always try to close the Responses envelope so Codex / Claude Code leave "running".
-	if termErr := emitFrames(streamer.Complete(&respUsage), true); termErr != nil && !clientGone && !upstreamMidError {
-		return usage, firstTokenMS, termErr
-	}
-	// If Complete was a no-op (empty payload) but we already opened the envelope
-	// (early Start), force a failed/completed terminal so the client unblocks.
-	if !streamer.HasClientPayload() {
-		// HasClientPayload now includes started envelope; if still empty of text/tools,
-		// Fail is preferred for true empty upstream.
-		_ = emitFrames(streamer.Fail("empty model output", "server_error"), true)
-		if upstreamMidError {
-			return usage, firstTokenMS, err
-		}
-	} else if clientGone || upstreamMidError {
-		// Soft disconnect / mid-stream upstream drop after content: Complete already forced.
-		return usage, firstTokenMS, nil
-	}
-	if clientGone {
-		return usage, firstTokenMS, nil
-	}
-	return usage, firstTokenMS, err
+	return runOpenAIResponsesStream(w, r, body, streamer, keepalive, maxTools, false, len(allowed) > 0)
 }
 
 func responsesToolDeltas(delta proxy.ChatDelta) []responses.ToolDelta {
@@ -1970,155 +1986,10 @@ func allowedResponsesToolNames(body map[string]any) []string {
 }
 
 // streamOpenAIResponsesContinue continues an already-opened Responses SSE after early envelope.
+// streamOpenAIResponsesContinue continues an already-opened Responses SSE after early envelope.
 func streamOpenAIResponsesContinue(w http.ResponseWriter, r *http.Request, body io.Reader, streamer *responses.LiveStreamer, keepalive time.Duration, maxTools int) (map[string]any, int, error) {
-	// toolsRequested inferred from pending/buffered tools or prior tool emissions.
 	toolsRequested := streamer != nil && (streamer.HasPendingTools() || streamer.HasClientPayload())
-	keepalive = effectiveResponsesKeepalive(keepalive, toolsRequested)
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return nil, 0, errors.New("streaming is not supported by this response writer")
-	}
-	if streamer == nil {
-		return nil, 0, errors.New("responses streamer required")
-	}
-	if maxTools < 0 {
-		maxTools = 0
-	}
-	writeFrames := func(frames []string, force bool) error {
-		if len(frames) == 0 {
-			return nil
-		}
-		if !force {
-			select {
-			case <-r.Context().Done():
-				return r.Context().Err()
-			default:
-			}
-		}
-		var buf strings.Builder
-		for _, frame := range frames {
-			buf.WriteString(frame)
-		}
-		_, err := w.Write([]byte(buf.String()))
-		if err != nil {
-			return err
-		}
-		flusher.Flush()
-		return nil
-	}
-	writeFrame := func(frame string, force bool) error {
-		return writeFrames([]string{frame}, force)
-	}
-	toolGap := outboundToolGapFrom(r.Context())
-	toolsEmitted := 0
-	emitFrames := func(frames []string, force bool) error {
-		if len(frames) == 0 {
-			return nil
-		}
-		// Keep each function_call added+delta+done in one Write+Flush so a soft
-		// disconnect cannot leave Codex with an in_progress item and no completed.
-		// toolGap still applies BETWEEN tools (flush previous group first).
-		batch := make([]string, 0, len(frames))
-		flushBatch := func() error {
-			if len(batch) == 0 {
-				return nil
-			}
-			if err := writeFrames(batch, force); err != nil {
-				return err
-			}
-			batch = batch[:0]
-			return nil
-		}
-		for _, frame := range frames {
-			isToolStart := strings.Contains(frame, "function_call") && strings.Contains(frame, "response.output_item.added")
-			if isToolStart {
-				if err := flushBatch(); err != nil {
-					return err
-				}
-				if toolGap > 0 && toolsEmitted > 0 {
-					timer := time.NewTimer(toolGap)
-					select {
-					case <-r.Context().Done():
-						timer.Stop()
-						// Soft disconnect after envelope: skip remaining toolGap and keep
-						// emitting frames so Codex still gets function_call + completed.
-					case <-timer.C:
-					}
-				}
-				toolsEmitted++
-			}
-			batch = append(batch, frame)
-		}
-		return flushBatch()
-	}
-	var usage map[string]any
-	firstTokenMS := 0
-	started := time.Now()
-	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
-		if event.Done {
-			return nil
-		}
-		delta, err := proxy.ParseChatDelta(event.Data)
-		if err != nil {
-			return nil
-		}
-		if firstTokenMS == 0 && (strings.TrimSpace(delta.Content) != "" || strings.TrimSpace(delta.Reasoning) != "" || len(delta.ToolCalls) > 0 || delta.FunctionCall != nil) {
-			firstTokenMS = int(time.Since(started).Milliseconds())
-			if firstTokenMS <= 0 {
-				firstTokenMS = 1
-			}
-		}
-		if raw, ok := delta.Usage.(map[string]any); ok {
-			usage = raw
-		}
-		if err := emitFrames(streamer.Reasoning(delta.Reasoning), true); err != nil {
-			return err
-		}
-		if err := emitFrames(streamer.Text(delta.Content), true); err != nil {
-			return err
-		}
-		if err := emitFrames(streamer.ToolDeltas(responsesToolDeltas(delta)), true); err != nil {
-			return err
-		}
-		// Incomplete tool args are held client-side-silent; force a keepalive so
-		// proxies do not treat the open Responses envelope as idle-disconnect.
-		if streamer.HasPendingTools() {
-			return writeFrame(responsesKeepaliveFrame(), true)
-		}
-		return nil
-	}, func() error {
-		// Soft disconnect: keep pumping keepalives (force) so Complete can still run.
-		select {
-		case <-r.Context().Done():
-			return writeFrame(responsesKeepaliveFrame(), true)
-		default:
-		}
-		return writeFrame(responsesKeepaliveFrame(), false)
-	})
-	clientGone := errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
-	hasPayload := streamer.HasClientPayload() || streamer.HasPendingTools()
-	upstreamMidError := err != nil && !clientGone
-	if upstreamMidError && !hasPayload {
-		msg, errType := openAIErrorFromCause(err)
-		_ = emitFrames(streamer.Fail(msg, errType), true)
-		return usage, firstTokenMS, err
-	}
-	respUsage := responsesUsageFromOpenAI(usage)
-	if termErr := emitFrames(streamer.Complete(&respUsage), true); termErr != nil && !clientGone && !upstreamMidError {
-		return usage, firstTokenMS, termErr
-	}
-	// Empty-only envelope: unblock client with failed terminal.
-	if !streamer.HasClientPayload() {
-		_ = emitFrames(streamer.Fail("empty model output", "server_error"), true)
-		if upstreamMidError {
-			return usage, firstTokenMS, err
-		}
-	}
-	if clientGone || upstreamMidError {
-		// Soft terminal after content (or pending tools force-finished).
-		return usage, firstTokenMS, nil
-	}
-	return usage, firstTokenMS, err
+	return runOpenAIResponsesStream(w, r, body, streamer, keepalive, maxTools, true, toolsRequested)
 }
 
 type responseAffinityStore interface {
@@ -2445,83 +2316,257 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	// multiple consecutive ctx-done hits across a short span before treating as gone.
 	probe := newDisconnectProbe(3, 800*time.Millisecond)
 	envelopeOpen := false
+	// Soft client write/ctx blips after envelope open must NOT abort ReadSSE:
+	// abort drains remaining upstream tool-arg frames → force-finish half tools →
+	// Claude Code "Tool use interrupted". Keep assembling; only best-effort write.
+	sw := newSSEWriter(w, flusher, r.Context())
 	var writeMu sync.Mutex
-
-	// Batch small frame groups into one Write+Flush to cut syscall/flush overhead
-	// on dense thinking/tool streams (Claude Code multi-tool turns).
+	// writeFrames writes one logical batch via shared sseWriter. Soft errors leave
+	// LastOK=false so callers Requeue instead of Acking half-open tool_use.
+	// Force is automatic once envelope is open so terminal tools can still land.
 	writeFrames := func(frames []string, force bool) error {
 		if len(frames) == 0 {
 			return nil
 		}
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		if !force {
-			select {
-			case <-r.Context().Done():
-				if !envelopeOpen {
-					return r.Context().Err()
-				}
-			default:
-			}
+		return sw.WriteStrings(frames, force || envelopeOpen || sw.SoftGone())
+	}
+	// ackBatchFromFrames marks only what this Write batch actually contained.
+	// Blind AckEmittedTools after a text/thinking-only flush would wrongly mark
+	// not-yet-written tools acked; missing Ack of message_stop leaves terminal
+	// pending stuck. Both paths surface as intermittent "Tool use interrupted".
+	// Each tool group is one content_block_start with content_block.type=tool_use
+	// (see anthropic.event JSON: `"type":"tool_use"` once per group).
+	ackBatchFromFrames := func(batch []string) {
+		joined := strings.Join(batch, "")
+		if strings.Contains(joined, "event: message_start") || strings.Contains(joined, `"type":"message_start"`) {
+			assembler.AckMessageStart()
 		}
-		var buf strings.Builder
-		for _, frame := range frames {
-			buf.WriteString(frame)
+		// Content-based tool Ack (by tool id in payload), not FIFO count. Multi-tool
+		// Finish writes groups independently; soft-fail of tool0 + success of tool1
+		// must not Ack tool0 via AckFirstPendingTools(1).
+		if strings.Contains(joined, `"type":"tool_use"`) || strings.Contains(joined, "tool_use") {
+			assembler.AckToolsInPayload(joined)
 		}
-		_, err := w.Write([]byte(buf.String()))
-		if err != nil {
-			return err
+		if strings.Contains(joined, "event: message_stop") || strings.Contains(joined, `"type":"message_stop"`) {
+			assembler.AckTerminal()
 		}
-		flusher.Flush()
-		return nil
 	}
 	toolGap := outboundToolGapFrom(r.Context())
 	toolsEmitted := 0
+	// pendingSSE coalesces live thinking/text micro-deltas (Claude Code long
+	// thinking turns) so we do not Flush once per token. Flushed on tool groups,
+	// terminal, size, idle, or first client-visible payload (TTFT).
+	pendingSSE := make([]byte, 0, textCoalesceMax*2)
+	firstPayloadFlushed := false
+	flushPendingSSE := func(force bool) error {
+		if len(pendingSSE) == 0 {
+			return nil
+		}
+		payload := pendingSSE
+		pendingSSE = pendingSSE[:0]
+		streamCoalesceFlush.Add(1)
+		// Direct WriteBytes: payload is already concatenated SSE frames.
+		writeMu.Lock()
+		err := sw.WriteBytes(payload, force || sw.SoftGone() || envelopeOpen)
+		writeMu.Unlock()
+		if err != nil {
+			return err
+		}
+		if sw.LastOK() {
+			envelopeOpen = true
+			firstPayloadFlushed = true
+		}
+		return nil
+	}
+	// Precompute keepalive once — Ping()+CommentKeepalive() allocate every call.
+	anthropicKeepaliveFrame := anthropic.Ping() + anthropic.CommentKeepalive()
+	// flushGroup writes one logical batch (text/thinking, one tool group, or
+	// message_delta+stop). requeueOnSoft controls whether a soft skip/fail
+	// immediately rolls assembler state back.
+	//
+	// Finish multi-group path MUST use requeueOnSoft=false for every group and
+	// only Requeue once AFTER all groups attempt. Mid-Finish Requeue clears
+	// pendingTerminal while later groups still hold the same message_stop bytes;
+	// a successful terminal Write then cannot AckTerminal → outer Finish re-emits
+	// tools + second message_stop → Claude Code "Tool use interrupted".
+	flushGroup := func(all []string, force bool, requeueOnSoft bool) error {
+		if len(all) == 0 {
+			return nil
+		}
+		if err := writeFrames(all, force || sw.SoftGone() || envelopeOpen); err != nil {
+			if requeueOnSoft && assembler.HasUnackedTools() {
+				assembler.RequeueUnackedTools()
+			}
+			return err
+		}
+		envelopeOpen = true
+		if sw.LastOK() {
+			ackBatchFromFrames(all)
+		} else if requeueOnSoft && assembler.HasUnackedTools() {
+			assembler.RequeueUnackedTools()
+		}
+		return nil
+	}
+	// flushGroupRetry re-attempts the SAME frame bytes after soft write blips.
+	// Never Requeue between attempts or between Finish groups — keep pending*
+	// so a successful retry can Ack. Caller requeues after the full multi-group
+	// emit if anything remains unacked.
+	flushGroupRetry := func(all []string, force bool, attempts int) error {
+		if attempts < 1 {
+			attempts = 1
+		}
+		var lastErr error
+		for i := 0; i < attempts; i++ {
+			if i > 0 {
+				// Brief backoff so a write-pressure blip can clear; keep total
+				// Finish recovery under a few ms for local sockets.
+				time.Sleep(time.Duration(i) * 2 * time.Millisecond)
+			}
+			lastErr = flushGroup(all, force, false)
+			if lastErr != nil {
+				return lastErr
+			}
+			if sw.LastOK() {
+				return nil
+			}
+		}
+		return lastErr
+	}
 	emitFrames := func(frames []string, force bool) error {
 		if len(frames) == 0 {
 			return nil
+		}
+		// Classify batch: pure thinking/text can coalesce; tools/terminal/message_start force.
+		needImmediate := force
+		if !needImmediate {
+			for _, frame := range frames {
+				if frameNeedsAnthropicImmediate(frame) {
+					needImmediate = true
+					break
+				}
+			}
+		}
+		if !needImmediate {
+			// Pure thinking_delta / text_delta path — coalesce micro frames.
+			for _, frame := range frames {
+				pendingSSE = append(pendingSSE, frame...)
+			}
+			if !firstPayloadFlushed || len(pendingSSE) >= textCoalesceMax {
+				return flushPendingSSE(true)
+			}
+			return nil
+		}
+		// Tools/terminal/start: drain coalesced thinking/text first (order: text then tools).
+		if err := flushPendingSSE(true); err != nil {
+			return err
 		}
 		// Keep each tool_use start+delta+stop in one Write+Flush. Flushing on
 		// content_block_start alone leaves Claude Code with a half-open tool_use
 		// block; a soft disconnect mid-group surfaces as "Tool use interrupted".
 		// toolGap still applies BETWEEN tools (flush previous group first).
-		batch := make([]string, 0, len(frames))
-		flushBatch := func() error {
-			if len(batch) == 0 {
-				return nil
+		//
+		// Finish (message_stop present): emit tool groups and terminal SEPARATELY
+		// with per-group Ack. A single giant multi-tool Write that soft-fails (or
+		// short-writes) would either drop everything or Ack frames the client never
+		// saw. Ordered per-tool Ack + terminal-last is what fully closes Claude Code.
+		hasTerminal := false
+		for _, f := range frames {
+			if strings.Contains(f, "message_stop") {
+				hasTerminal = true
+				break
 			}
-			if err := writeFrames(batch, force); err != nil {
-				return err
+		}
+		// Split frames into ordered groups: non-tool prefix, each tool_use
+		// start+delta+stop cluster, and trailing terminal (message_delta/stop).
+		// Tool clusters start at content_block_start+tool_use.
+		groups := make([][]string, 0, 4)
+		cur := make([]string, 0, 4)
+		flushCur := func() {
+			if len(cur) == 0 {
+				return
 			}
-			envelopeOpen = true
-			batch = batch[:0]
-			return nil
+			groups = append(groups, cur)
+			cur = make([]string, 0, 4)
 		}
 		for _, frame := range frames {
-			isToolStart := strings.Contains(frame, `"tool_use"`) && strings.Contains(frame, "content_block_start")
+			isToolStart := frameIsAnthropicToolStart(frame)
+			isTerminalFrame := frameIsAnthropicTerminal(frame)
 			if isToolStart {
-				// Flush prior text/thinking/previous tool before a new tool group.
-				if err := flushBatch(); err != nil {
-					return err
+				flushCur()
+			} else if isTerminalFrame && len(cur) > 0 {
+				// Do not mix tool/text frames with terminal in one Write.
+				// Detect first terminal-ish frame after non-terminal content.
+				joinedCur := strings.Join(cur, "")
+				if strings.Contains(joinedCur, `"type":"tool_use"`) || strings.Contains(joinedCur, "content_block") ||
+					strings.Contains(joinedCur, "message_start") {
+					flushCur()
 				}
-				if toolGap > 0 && toolsEmitted > 0 {
-					timer := time.NewTimer(toolGap)
-					select {
-					case <-r.Context().Done():
-						timer.Stop()
-						// Soft disconnect after envelope: skip remaining toolGap and keep
-						// emitting so Claude Code still gets delta/stop + message_stop.
+			}
+			cur = append(cur, frame)
+		}
+		flushCur()
+
+		if hasTerminal {
+			// Finish path: per-group retry (tools first, terminal last). Do NOT
+			// requeue between groups — pending* must stay until Ack or until the
+			// whole multi-group emit ends. Soft-fail of tool N leaves it unacked;
+			// terminal success still Acks message_stop; outer Finish rebuilds
+			// only the remaining unacked tools (toolsOnly when terminal already
+			// delivered).
+			var firstHard error
+			for _, g := range groups {
+				if err := flushGroupRetry(g, force, 3); err != nil {
+					if firstHard == nil {
+						firstHard = err
+					}
+					// Keep trying remaining groups (esp. message_stop) so Claude
+					// Code can leave "running" even if one tool Write hard-failed.
+				}
+			}
+			if assembler.HasUnackedTools() {
+				// Roll back anything that never Ack'd so outer Finish can rebuild
+				// complete start+delta+stop groups (and message_stop if needed).
+				assembler.RequeueUnackedTools()
+			}
+			return firstHard
+		}
+
+		// Live mid-stream: same per-tool grouping; single attempt here — outer
+		// Finish recovery re-emits anything left unacked.
+		for i, g := range groups {
+			// toolGap between live tool groups (not before the first).
+			if toolGap > 0 && toolsEmitted > 0 {
+				isToolGroup := false
+				for _, f := range g {
+					if strings.Contains(f, `"tool_use"`) {
+						isToolGroup = true
+						break
+					}
+				}
+				if isToolGroup {
+					if waitToolGap(r.Context(), toolGap) {
+						sw.MarkSoftGone()
 						if !envelopeOpen && !force {
 							return r.Context().Err()
 						}
-					case <-timer.C:
 					}
 				}
-				toolsEmitted++
 			}
-			batch = append(batch, frame)
+			// Live path: requeue on soft fail so Finish can rebuild complete groups.
+			if err := flushGroup(g, force, true); err != nil {
+				return err
+			}
+			for _, f := range g {
+				if strings.Contains(f, `"tool_use"`) && strings.Contains(f, "content_block_start") {
+					toolsEmitted++
+					break
+				}
+			}
+			_ = i
 		}
-		return flushBatch()
+		return nil
 	}
 
 	// Early envelope: Claude Code perceived TTFT starts when message_start lands,
@@ -2547,20 +2592,28 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	}
 
 	onIdle := func() error {
-		if probe.check(r.Context()) && !envelopeOpen {
-			return r.Context().Err()
+		// Drain coalesced thinking/text so clients are not stuck waiting for size.
+		_ = flushPendingSSE(true)
+		if probe.check(r.Context()) {
+			sw.MarkSoftGone()
+			if !envelopeOpen {
+				return r.Context().Err()
+			}
 		}
 		// Always force when holding tools/text so idle timer resets client-side even
 		// under write-pressure (Claude Code multi-minute Update/Edit turns).
-		force := toolsRequested || assembler.NeedsClientKeepalive()
-		return writeFrames([]string{anthropic.Ping(), anthropic.CommentKeepalive()}, force)
+		force := toolsRequested || assembler.NeedsClientKeepalive() || sw.SoftGone() || envelopeOpen
+		return sw.Keepalive(anthropicKeepaliveFrame, DefaultKeepaliveInterval, force)
 	}
 
 	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
 		// After envelope is open, soft-disconnect probes must not abort mid-stream;
 		// terminal frames still need to land so Claude Code can leave "running".
-		if probe.check(r.Context()) && !envelopeOpen {
-			return r.Context().Err()
+		if probe.check(r.Context()) {
+			sw.MarkSoftGone()
+			if !envelopeOpen {
+				return r.Context().Err()
+			}
 		}
 		if event.Done {
 			return nil
@@ -2593,21 +2646,29 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 				}
 			}
 		}
-		if err := emitFrames(assembler.Feed(delta.Content, delta.Reasoning, delta.AnthropicToolDeltas()), true); err != nil {
-			return err
+		// Live path: do NOT force-flush pure thinking/text (coalesce). Tools/start
+		// inside Feed still force via needImmediate classification in emitFrames.
+		// Soft write errors are still swallowed by sseWriter after envelope open.
+		wroteFrames := false
+		feedFrames := assembler.Feed(delta.Content, delta.Reasoning, delta.AnthropicToolDeltas())
+		if len(feedFrames) > 0 {
+			if err := emitFrames(feedFrames, false); err != nil {
+				return err
+			}
+			wroteFrames = true
 		}
-		// Incomplete tool args are held client-side-silent; force Anthropic ping so
-		// reverse proxies do not cut Claude Code during multi-second tool drips.
-		// Held text (toolsRequested) or incomplete tool args: client is silent;
-		// force Anthropic keepalive so reverse proxies / Claude Code do not cut
-		// the stream during multi-second tool-prep or Update arg drips.
-		if assembler.NeedsClientKeepalive() {
-			return writeFrames([]string{anthropic.Ping(), anthropic.CommentKeepalive()}, true)
+		// Incomplete tool args / held text: throttled keepalive. Skip when we just
+		// wrote real frames this tick (socket already warm).
+		if assembler.NeedsClientKeepalive() && !wroteFrames && len(pendingSSE) == 0 {
+			return sw.Keepalive(anthropicKeepaliveFrame, DefaultKeepaliveInterval, true)
 		}
 		return nil
 	}, onIdle)
 
-	clientGone := probe.gone || errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
+	// Drain any coalesced thinking/text before terminal Finish / empty checks.
+	_ = flushPendingSSE(true)
+
+	clientGone := sw.SoftGone() || probe.gone || errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
 	// Real payload = model deltas OR assembler emitted/held content/tools.
 	// Early message_start alone must NOT count as success (admin showed ok=true,
 	// tokens=0, ttft=null for ~1s intermittent empties).
@@ -2623,12 +2684,13 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		return openAIUsage, firstTokenMS, err
 	}
 	if !hasPayload {
-		if clientGone {
-			// Soft disconnect before any model payload: still close envelope if open.
-			_ = emitFrames(assembler.Finish("stop", usage), true)
-			return openAIUsage, firstTokenMS, nil
-		}
+		// Soft disconnect before any model payload is still a hollow stream —
+		// never soft-ok (admin ok=true tokens=0). Close envelope if open, then fail.
 		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+		if clientGone {
+			_ = emitFrames(assembler.Finish("stop", usage), true)
+			return openAIUsage, firstTokenMS, empty
+		}
 		msg, errType := anthropicErrorFromCause(empty)
 		_ = emitFrames(anthropic.TerminalError(msg, errType), true)
 		return openAIUsage, firstTokenMS, empty
@@ -2639,21 +2701,45 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	// Always try terminal frames after any payload (including write-error soft disconnect
 	// and mid-stream upstream errors) so Claude Code never hangs on a half-open
 	// tool_use as "Tool use interrupted" / "Server error mid-response".
+	// Finish requeues unacked tools first; emitFrames writes tool groups then
+	// message_delta/stop as separate groups with per-group retry. Soft write of a
+	// group Requeues (clears pending) — NeedsFinishRetry still sees
+	// !TerminalDelivered / pending tools and forces another Finish.
 	if termErr := emitFrames(assembler.Finish(finish, usage), true); termErr != nil && !clientGone && !upstreamMidError {
 		return openAIUsage, firstTokenMS, termErr
 	}
-	// After Finish, if every tool was incomplete and no text was flushed, treat as empty.
-	if !assembler.HasClientPayload() && !assembler.HasPendingTools() {
-		// Finish may have released held text; re-check. If still nothing visible,
-		// fail the request so callers don't mark ok=true with zero tokens.
-		if !sawModel {
-			empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+	// Soft-fail recovery: more Finish rebuilds (tools + message_stop). Each rebuild
+	// re-emits only unacked/pending work; Ack'd tools are skipped. Requeue also
+	// UnackTerminal when tools need re-emit so tool_use never follows message_stop
+	// ("Tool use interrupted").
+	for attempt := 0; attempt < 4 && assembler.NeedsFinishRetry(); attempt++ {
+		_ = emitFrames(assembler.Finish(finish, usage), true)
+	}
+	// After Finish, incomplete-only tools (never started) + no text is empty —
+	// even if sawModel was true from upstream tool deltas. That was the intermittent
+	// ok=true tokens=0 TTFT>0 path Claude Code reports as "Tool use interrupted".
+	if !assembler.HasClientPayload() {
+		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+		if !assembler.TerminalDelivered() {
 			_ = emitFrames(anthropic.TerminalError(empty.Error(), "api_error"), true)
-			return openAIUsage, firstTokenMS, empty
 		}
+		return openAIUsage, firstTokenMS, empty
+	}
+	// Recovery exhausted with half-open tools / no terminal: fail (not soft-ok).
+	// clientGone after undelivered tools is still a failure — Claude Code shows
+	// "Tool use interrupted" and admin must not record ok=true tokens=0.
+	if !assembler.ClientDeliveryOK() {
+		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+		if !assembler.TerminalDelivered() {
+			_ = emitFrames(anthropic.TerminalError(empty.Error(), "api_error"), true)
+		}
+		if upstreamMidError && err != nil {
+			return openAIUsage, firstTokenMS, err
+		}
+		return openAIUsage, firstTokenMS, empty
 	}
 	if clientGone || upstreamMidError {
-		// Soft terminal: client left, or upstream dropped after real payload.
+		// Soft terminal: client left, or upstream dropped after FULL delivery.
 		// Do not return the raw upstream err — stream already closed cleanly.
 		return openAIUsage, firstTokenMS, nil
 	}
@@ -2680,6 +2766,7 @@ func isSoftClientWriteError(err error) bool {
 		"client disconnected",
 		"i/o timeout",
 		"write: connection",
+		"short write",
 		"wsasend",
 	} {
 		if strings.Contains(msg, needle) {
@@ -3214,6 +3301,7 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 		"usage":                 usageLightSnapshot(r.Context(), options),
 		"leader":                leaderStatus(r.Context(), options),
 		"redis":                 map[string]any{"enabled": redisEnabled, "prefix": options.Config.RedisPrefix},
+		"stream":                streamSnapshot(),
 	}
 	if protected {
 		payload["credentials"] = map[string]any{"email": nil, "active_count": pool.Live, "account_count": accountCount, "ok": pool.Live > 0}
@@ -6791,14 +6879,55 @@ func serveStatic(w http.ResponseWriter, r *http.Request, staticDir, name string)
 		http.NotFound(w, r)
 		return
 	}
-	serveFile(w, r, filepath.Join(staticDir, cleaned), false)
+	// Content-hashed dist assets (core.f5e0a3148a.js) are immutable forever.
+	// HTML admin pages stay no-store via serveAdminPage. Non-hashed sources
+	// (static/js/*.js) are not long-cached so deploys without hash don't stick.
+	longCache := isHashedDistAsset(cleaned)
+	serveFile(w, r, filepath.Join(staticDir, cleaned), false, longCache)
 }
 
-func serveFile(w http.ResponseWriter, r *http.Request, name string, noStore bool) {
+// isHashedDistAsset reports whether cleaned path is under /dist/ and the
+// basename looks like name.<8+hex>.js|css (content-hash fingerprint).
+func isHashedDistAsset(cleaned string) bool {
+	// cleaned is like "/dist/core.f5e0a3148a.js"
+	if !strings.HasPrefix(cleaned, "/dist/") {
+		return false
+	}
+	base := filepath.Base(cleaned)
+	// e.g. core.f5e0a3148a.js, admin-antd.1031c5bb2f.css
+	dot := strings.LastIndex(base, ".")
+	if dot <= 0 {
+		return false
+	}
+	ext := strings.ToLower(base[dot+1:])
+	if ext != "js" && ext != "css" {
+		return false
+	}
+	name := base[:dot]
+	hashDot := strings.LastIndex(name, ".")
+	if hashDot <= 0 || hashDot == len(name)-1 {
+		return false
+	}
+	hash := name[hashDot+1:]
+	if len(hash) < 8 {
+		return false
+	}
+	for _, c := range hash {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func serveFile(w http.ResponseWriter, r *http.Request, name string, noStore bool, longCache ...bool) {
 	if noStore {
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
+	} else if len(longCache) > 0 && longCache[0] {
+		// Content-hashed dist filenames are safe to cache for 1y.
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
 	info, err := os.Stat(name)
 	if err != nil || info.IsDir() {

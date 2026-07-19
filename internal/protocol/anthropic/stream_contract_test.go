@@ -35,6 +35,9 @@ func TestStreamContractTextThinkingToolOrder(t *testing.T) {
 	// tool rewrite Update->Edit dense index 0
 	a = NewStreamAssembler("m3", "grok", true, 1, []string{"Edit"})
 	frames = a.Feed("preface", "", []ToolDelta{{Index: 0, ID: "c1", Name: "Update", Arguments: `{"file_path":"/x","old_string":"a","new_string":""}`}})
+	// Successful client write — without Ack, Finish requeues and re-emits tools
+	// at a new dense index, which would fail the dense-index-0 contract.
+	a.AckEmittedTools()
 	frames = append(frames, a.Finish("tool_calls", Usage{})...)
 	events = ParseEvents(frames)
 	toolIndex := -1

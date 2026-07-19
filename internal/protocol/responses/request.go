@@ -36,6 +36,7 @@ func BuildChatBody(raw map[string]any, model string) map[string]any {
 	copyIfPresent(body, raw, "prompt_cache_key")
 	copyIfPresent(body, raw, "prompt_cache_retention")
 	if meta, ok := raw["metadata"].(map[string]any); ok {
+		body["metadata"] = meta // keep for Codex client detection / sticky hints
 		if body["user"] == nil && meta["user"] != nil {
 			body["user"] = meta["user"]
 		}

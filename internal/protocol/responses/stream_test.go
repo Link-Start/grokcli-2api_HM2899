@@ -380,3 +380,286 @@ func TestCompleteHoldFailureReturnsNil(t *testing.T) {
 		t.Fatalf("hold-failure Complete should be empty for Fail path, got %d frames: %v", len(frames), frames)
 	}
 }
+
+func TestRequeueUnackedToolsReemitsOnComplete(t *testing.T) {
+	s := NewLiveStreamer("resp_soft", "grok", []string{"Edit"})
+	_ = s.Start()
+	frames := s.ToolDeltas([]ToolDelta{{
+		Index: 0, ID: "call_1", Name: "Edit",
+		Arguments: `{"file_path":"/x","old_string":"a","new_string":"b"}`,
+	}})
+	if len(frames) == 0 {
+		t.Fatal("expected tool frames")
+	}
+	if !s.HasUnackedTools() {
+		t.Fatal("expected unacked tools after emit without Ack")
+	}
+	s.RequeueUnackedTools()
+	if s.HasUnackedTools() {
+		t.Fatal("after requeue, unacked flags should clear (tools pending)")
+	}
+	if !s.HasPendingTools() {
+		t.Fatal("requeued tool must be pending again")
+	}
+	out := strings.Join(s.Complete(&Usage{}), "")
+	for _, marker := range []string{"function_call", "call_1", "response.completed", "[DONE]"} {
+		if !strings.Contains(out, marker) {
+			t.Fatalf("missing %q after Complete re-emit: %s", marker, out)
+		}
+	}
+	if !s.HasUnackedTools() {
+		t.Fatal("Complete frames not yet Ack'd")
+	}
+	s.AckEmittedTools()
+	if s.HasUnackedTools() || !s.TerminalDelivered() {
+		t.Fatal("after AckEmittedTools, terminal should be delivered")
+	}
+	if more := s.Complete(&Usage{}); len(more) != 0 {
+		t.Fatalf("second Complete after Ack should be empty, got %d frames", len(more))
+	}
+}
+
+func TestSoftFailTerminalNeedsFinishRetry(t *testing.T) {
+	s := NewLiveStreamer("resp_term", "grok", []string{"Read"})
+	_ = s.Start()
+	_ = s.ToolDeltas([]ToolDelta{{
+		Index: 0, ID: "call_r", Name: "Read",
+		Arguments: `{"file_path":"/y"}`,
+	}})
+	out := s.Complete(&Usage{})
+	if len(out) == 0 {
+		t.Fatal("expected Complete frames")
+	}
+	s.RequeueUnackedTools()
+	if !s.NeedsFinishRetry() {
+		t.Fatal("NeedsFinishRetry after soft requeue")
+	}
+	retry := strings.Join(s.Complete(&Usage{}), "")
+	if !strings.Contains(retry, "response.completed") {
+		t.Fatalf("retry Complete missing completed: %s", retry)
+	}
+	s.AckEmittedTools()
+	if s.NeedsFinishRetry() {
+		t.Fatal("no retry needed after Ack")
+	}
+}
+
+
+func TestRequeueUnacksTerminalWhenToolsRetry(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_rq", "grok", []string{"Read"}, 2)
+	// Emit one complete tool and Ack terminal as if write succeeded for completed only.
+	frames := s.ToolDeltas([]ToolDelta{{Index: 0, ID: "c1", Name: "Read", Arguments: `{"file_path":"/a.go"}`}})
+	if len(frames) == 0 {
+		t.Fatal("expected tool frames")
+	}
+	// Simulate: tool write soft-failed (not Ack'd), but somehow terminal was Ack'd
+	// (split multi-group path). Requeue must UnackTerminal so Complete re-emits tools THEN completed.
+	s.pendingTerminal = true
+	s.AckTerminal()
+	if !s.TerminalDelivered() {
+		t.Fatal("terminal should be delivered before requeue")
+	}
+	// Leave tool unacked (emitted, clientAcked=false).
+	s.RequeueUnackedTools()
+	if s.TerminalDelivered() {
+		t.Fatal("requeue of unacked tool must UnackTerminal — tools after completed is Tool use interrupted")
+	}
+	out := s.Complete(&Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
+	joined := ""
+	for _, f := range out {
+		joined += f
+	}
+	// Must include function_call before completed
+	fc := strings.Index(joined, "function_call")
+	done := strings.Index(joined, "response.completed")
+	if fc < 0 || done < 0 {
+		t.Fatalf("expected function_call and completed, out=%q", joined[:min(400, len(joined))])
+	}
+	if fc > done {
+		t.Fatalf("function_call must come BEFORE response.completed; fc=%d done=%d", fc, done)
+	}
+	if !s.ClientDeliveryOK() {
+		// Complete produced frames; Ack them
+		s.AckEmittedTools()
+	}
+	if !s.ClientDeliveryOK() {
+		t.Fatalf("after Ack, ClientDeliveryOK should be true; terminal=%v unacked=%v", s.TerminalDelivered(), s.HasUnackedTools())
+	}
+}
+
+func TestClientDeliveryOKRejectsUnackedTools(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_ok", "grok", []string{"Read"}, 1)
+	_ = s.ToolDeltas([]ToolDelta{{Index: 0, ID: "c1", Name: "Read", Arguments: `{"file_path":"/a.go"}`}})
+	_ = s.Complete(&Usage{})
+	// Terminal pending, tools unacked
+	if s.ClientDeliveryOK() {
+		t.Fatal("unacked tools + unacked terminal must not be ClientDeliveryOK")
+	}
+	s.AckEmittedTools()
+	if !s.ClientDeliveryOK() {
+		t.Fatal("after full Ack, ClientDeliveryOK expected")
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func TestLiveStreamerRequeueUnacksTerminal(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_requeue", "grok", []string{"Edit"}, 2)
+	frames := s.ToolDeltas([]ToolDelta{{
+		Index: 0, ID: "call_1", Name: "Edit",
+		Arguments: `{"file_path":"/x","old_string":"a","new_string":"b"}`,
+	}})
+	if len(frames) == 0 {
+		t.Fatal("expected live tool frames")
+	}
+	term := s.Complete(&Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
+	if len(term) == 0 {
+		t.Fatal("expected Complete frames")
+	}
+	s.AckEmittedTools()
+	if !s.TerminalDelivered() {
+		t.Fatal("terminal should be delivered after Ack")
+	}
+	// Soft-fail tool after terminal Ack: leave tool unacked but emitted.
+	for _, st := range s.tools {
+		if st != nil {
+			st.clientAcked = false
+			st.emitted = true
+		}
+	}
+	s.pendingClientAcks = []int{0}
+	s.RequeueUnackedTools()
+	if s.TerminalDelivered() {
+		t.Fatal("Requeue with unacked tools must UnackTerminal")
+	}
+	again := s.Complete(&Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
+	joined := strings.Join(again, "")
+	if !strings.Contains(joined, "function_call") {
+		t.Fatalf("expected re-emitted function_call:\n%s", joined)
+	}
+	if !strings.Contains(joined, "response.completed") {
+		t.Fatalf("expected response.completed after recovery:\n%s", joined)
+	}
+}
+
+func TestLiveStreamerClientDeliveryOK(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_ok", "grok", []string{"Read"}, 1)
+	if s.ClientDeliveryOK() {
+		t.Fatal("empty streamer must not be ClientDeliveryOK")
+	}
+	_ = s.Text("hi")
+	_ = s.Complete(&Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
+	s.AckEmittedTools()
+	if !s.ClientDeliveryOK() {
+		t.Fatal("text + terminal Ack should be ClientDeliveryOK")
+	}
+	// Tool framed but unacked after terminal → not OK.
+	s2 := NewLiveStreamerWithMaxTools("resp_tool", "grok", []string{"Read"}, 1)
+	_ = s2.ToolDeltas([]ToolDelta{{
+		Index: 0, ID: "c1", Name: "Read",
+		Arguments: `{"file_path":"/a.go"}`,
+	}})
+	_ = s2.Complete(&Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
+	// Ack only terminal, not tools.
+	s2.AckTerminal()
+	if s2.ClientDeliveryOK() {
+		t.Fatal("unacked tool must not be ClientDeliveryOK")
+	}
+	s2.AckEmittedTools()
+	if !s2.ClientDeliveryOK() {
+		t.Fatal("acked tool + terminal should be ClientDeliveryOK")
+	}
+}
+
+
+func TestRequeueUnacksTerminalBeforeToolRetry(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_u", "m", []string{"Read"}, 2)
+	_ = s.Start()
+	frames := s.ToolDeltas([]ToolDelta{{
+		Index: 0, ID: "call_1", Name: "Read",
+		Arguments: `{"file_path":"/a.go"}`,
+	}})
+	if len(frames) == 0 {
+		t.Fatal("expected tool frames")
+	}
+	joined := ""
+	for _, f := range frames {
+		joined += f
+	}
+	s.AckToolsInPayload(joined)
+	term := s.Complete(&Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
+	termJoined := ""
+	for _, f := range term {
+		termJoined += f
+	}
+	if !strings.Contains(termJoined, "response.completed") {
+		t.Fatalf("expected completed, got %q", termJoined)
+	}
+	s.AckTerminal()
+	if !s.TerminalDelivered() {
+		t.Fatal("terminal should be delivered")
+	}
+	// Second tool framed but soft-fail (emitted, not acked)
+	s.tools[1] = &liveTool{
+		id: "call_2", name: "Read", arguments: `{"file_path":"/b.go"}`,
+		emitted: true, clientAcked: false, itemID: "fc_x_1", output: 2,
+	}
+	s.toolsStarted++
+	s.RequeueUnackedTools()
+	if s.TerminalDelivered() {
+		t.Fatal("Requeue of unacked tools must UnackTerminal")
+	}
+	out := s.Complete(&Usage{InputTokens: 1, OutputTokens: 2, TotalTokens: 3})
+	joinedOut := ""
+	for _, f := range out {
+		joinedOut += f
+	}
+	fc := strings.Index(joinedOut, "function_call")
+	done := strings.Index(joinedOut, "response.completed")
+	if fc < 0 {
+		t.Fatalf("expected re-emitted function_call, got %q", joinedOut)
+	}
+	if done < 0 {
+		t.Fatalf("expected response.completed after unack, got %q", joinedOut)
+	}
+	if done < fc {
+		t.Fatalf("completed must not precede re-emitted tool: fc=%d done=%d body=%q", fc, done, joinedOut)
+	}
+}
+
+func TestClientDeliveryOKRequiresAckedToolOrText(t *testing.T) {
+	s := NewLiveStreamer("resp_ok", "m", nil)
+	if s.ClientDeliveryOK() {
+		t.Fatal("empty streamer not OK")
+	}
+	_ = s.Text("hi")
+	_ = s.Complete(&Usage{OutputTokens: 1})
+	s.AckTerminal()
+	if !s.ClientDeliveryOK() {
+		t.Fatal("text + terminal should be OK")
+	}
+
+	s2 := NewLiveStreamerWithMaxTools("resp_ok2", "m", []string{"Read"}, 1)
+	_ = s2.ToolDeltas([]ToolDelta{{
+		Index: 0, ID: "c1", Name: "Read", Arguments: `{"file_path":"/x"}`,
+	}})
+	_ = s2.Complete(&Usage{OutputTokens: 1})
+	if s2.ClientDeliveryOK() {
+		t.Fatal("unacked tool must not be ClientDeliveryOK")
+	}
+	for _, st := range s2.tools {
+		if st != nil && st.emitted {
+			st.clientAcked = true
+		}
+	}
+	s2.terminalEmitted = true
+	s2.pendingTerminal = false
+	if !s2.ClientDeliveryOK() {
+		t.Fatal("acked tool + terminal should be OK")
+	}
+}

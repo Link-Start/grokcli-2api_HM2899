@@ -48,6 +48,8 @@ window.G2A = window.G2A || {};
   let accountsTotalPages = 1;
   let accountsLoading = false;
   let accountsLoadSeq = 0;
+  // Wall-clock when the current full list load began — used by the stuck-loading watchdog.
+  let accountsLoadingSince = 0;
   let accountsPageSize = 25;
   let accountsSearchQuery = "";
   let accountsSort = "newest";
@@ -349,6 +351,22 @@ async function softNavigate(name, opts) {
       // Models page: load dedicated catalog first (do not rely on /dashboard).
       if (page === "models" && typeof loadModels === "function") {
         Promise.resolve(loadModels()).catch((e) => console.warn("soft nav loadModels", e));
+      } else if (page === "accounts") {
+        // Single list load only — never also call loadDashboard here (double /accounts
+        // races accountsLoadSeq and can leave the table stuck on "加载账号中…").
+        // After soft-nav DOM swap the tbody is empty even if accountsList still has
+        // rows from a prior visit — paint cache first, then silent re-sync.
+        if (typeof loadAccountsPage === "function") {
+          try {
+            if (accountsList && accountsList.length && typeof renderAccountsPage === "function") {
+              renderAccountsPage();
+            }
+          } catch (_) {}
+          const tbody = $("accounts-tbody");
+          const painted = !!(tbody && tbody.querySelector("tr[data-acc-id]"));
+          Promise.resolve(loadAccountsPage({ reset: false, silent: painted }))
+            .catch((e) => console.warn("soft nav loadAccountsPage", e));
+        }
       } else if (typeof loadDashboard === "function") {
         Promise.resolve(loadDashboard()).catch((e) => console.warn("soft nav loadDashboard", e));
       }
@@ -373,7 +391,8 @@ async function softNavigate(name, opts) {
     }
     // Page-specific renders after content swap
     try {
-      if (page === "accounts" && typeof renderAccounts === "function") renderAccounts();
+      // accounts: list load kicked off above (single path). Do not start a second
+      // /accounts fetch here — seq race left the table stuck on "加载中".
       if (page === "keys" && typeof renderKeys === "function") renderKeys();
       if (page === "logs" && typeof loadAdminLogs === "function") loadAdminLogs({ reset: false });
       if (page === "usage" && typeof loadUsage === "function") loadUsage();
@@ -482,6 +501,8 @@ function rebindPageControls() {
       if (page === "models" && typeof loadModels === "function") {
         const list = await loadModels();
         toast(`已刷新模型列表（${(list || []).length} 个）`);
+      } else if (page === "accounts" && typeof refreshAccountsListUI === "function") {
+        await refreshAccountsListUI({ toastOk: "已刷新账号列表", force: true });
       } else {
         await loadDashboard();
         toast("已刷新");
@@ -630,18 +651,7 @@ function rebindPageControls() {
   try { updateOutboundProxyHint(); } catch (_) {}
   on("btn-refresh-acc", "onclick", async () => {
     try {
-      _statusFetchedAt = 0;
-      // Prefer silent hot-refresh (no full-table flash) when list is already loaded.
-      if (typeof hotRefreshAccountsPage === "function" && (accountsList || []).length) {
-        statusCache = await api("/status");
-        _statusFetchedAt = Date.now();
-        if (window.G2A && G2A.state) G2A.state.status = statusCache;
-        try { renderAccountStatusChips(); } catch (_) {}
-        await hotRefreshAccountsPage();
-      } else {
-        await loadAccountsPage({ reset: false });
-      }
-      toast("已热更新");
+      await refreshAccountsListUI({ toastOk: "已热更新", force: true });
     } catch (e) { toast(e.message, false); }
   });
 
@@ -747,8 +757,26 @@ function rebindPageControls() {
   on("btn-copy-device", "onclick", () => copyDeviceCode());
   on("btn-import", "onclick", () => importJsonFiles());
   on("btn-import-sso", "onclick", () => importSsoCookies());
-on("btn-export-sso", "onclick", () => exportRegistrationSso());
+  on("btn-export-sso", "onclick", () => exportRegistrationSso());
   if ($("btn-export")) on("btn-export", "onclick", () => exportAllAccounts());
+  // Soft-nav swaps #main-content; rebind file pickers so name labels update again.
+  on("import-file", "onchange", () => {
+    const files = $("import-file") && $("import-file").files;
+    const label = $("import-file-name");
+    if (!label) return;
+    if (!files || !files.length) label.textContent = "未选择文件";
+    else if (files.length === 1) label.textContent = `已选择：${files[0].name}（${(files[0].size / 1024).toFixed(1)} KB）`;
+    else {
+      const totalKb = Array.from(files).reduce((s, f) => s + f.size, 0) / 1024;
+      label.textContent = `已选择 ${files.length} 个文件（共 ${totalKb.toFixed(1)} KB）`;
+    }
+  });
+  on("sso-file", "onchange", () => {
+    const f = $("sso-file") && $("sso-file").files && $("sso-file").files[0];
+    const label = $("sso-file-name");
+    if (!label) return;
+    label.textContent = f ? `已选择：${f.name}（${(f.size / 1024).toFixed(1)} KB）` : "未选择文件";
+  });
   on("btn-logout-cli", "onclick", async () => {
     if (!confirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）")) return;
     try {
@@ -925,9 +953,9 @@ on("btn-export-sso", "onclick", () => exportRegistrationSso());
             applyAccountLivePatch(id, { _pool: qPatch });
             try { renderAccountStatusChips(); } catch (_) {}
             try { renderStats(); } catch (_) {}
-            // Live patch first; re-sync DB in background (async SaveQuotaSnapshot may still land).
+            // Live patch first; silent re-sync (merge keeps fresher live quota if PG lags).
             Promise.resolve().then(async () => {
-              try { await loadAccountsPage({ reset: false }); } catch (_) {}
+              try { await loadAccountsPage({ reset: false, silent: true }); } catch (_) {}
             });
           } catch (err) {
             toast((err && err.message) || "额度查询失败", false);
@@ -1086,32 +1114,18 @@ async function bootstrap() {
     try { rebindPageControls(); } catch(_){}
     if (page === "overview" || page === "accounts" || page === "usage") startAutoUiRefresh();
     if (page === "accounts") {
-      renderAccounts();
+      // loadDashboard already called renderAccounts → loadAccountsPage once.
+      // Only re-load if the first path failed to populate (network race / empty).
+      if (!(accountsList && accountsList.length) && !accountsLoading) {
+        try { loadAccountsPage({ reset: false, silent: true }); } catch (_) {}
+      }
       try {
         restoreActiveRegistration({ force: !hasTrackedRegTask(), toastIfEmpty: false }).catch(() => {});
       } catch (_) {}
     }
     if (page === "keys") renderKeys();
-    on("btn-logout", "onclick", async () => {
-      try { await api("/logout", { method: "POST", body: "{}" }); } catch (_) {}
-      try { if (window.G2A && G2A.clearToken) G2A.clearToken(); else localStorage.removeItem(TOKEN_KEY); } catch (_) {}
-      document.body.classList.remove("is-authed");
-      location.replace("/admin/login");
-    });
-    on("btn-refresh", "onclick", async () => {
-      try {
-        _statusFetchedAt = 0;
-        statusCache = null;
-        const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
-        if (page === "models" && typeof loadModels === "function") {
-          const list = await loadModels();
-          toast(`已刷新模型列表（${(list || []).length} 个）`);
-        } else {
-          await loadDashboard();
-          toast("已刷新");
-        }
-      } catch (e) { toast(e.message, false); }
-    });
+    // btn-refresh / btn-logout already bound by rebindPageControls() above.
+    // Do not re-bind here — a second handler used to drop the accounts force-refresh path.
   } catch (e) {
     if (e && e.status === 401) {
       try { if (window.G2A && G2A.clearToken) G2A.clearToken(); } catch (_) {}
@@ -1276,6 +1290,7 @@ function renderStats() {
   const keys = d.keys || s.keys || {};
   const acc = d.accounts || s.accounts || {};
   const tm = d.token_maintainer || s.token_maintainer || {};
+  const stream = d.stream || s.stream || {};
   const lastTm = tm.last || {};
   const rem = (tm.min_remaining_sec != null ? tm.min_remaining_sec : lastTm.min_remaining_sec);
   const nextWait = (tm.next_wait_sec != null ? tm.next_wait_sec : (lastTm.next_wait_sec != null ? lastTm.next_wait_sec : tm.interval_sec));
@@ -1295,7 +1310,9 @@ function renderStats() {
       <div class="sub">请求 ${fmtNum((d.usage || s.usage || {}).today_requests ?? 0)} · 累计 ${fmtTokens((d.usage || s.usage || {}).total_tokens ?? 0)}（已扣缓存）</div></div>
     <div class="stat"><div class="label">Token 自动续期</div><div class="value">${(tm.running || tm.cluster_running || tm.leader_running) ? "运行中" : (tm.enabled === false ? "已关闭" : (tm.enabled ? "已启用" : "未运行"))}</div>
       <div class="sub">最短剩余 ${esc(remLabel)} · 下次 ${nextWait ?? "—"}s${lastRef != null ? ` · 上次刷新 ${lastRef}` : ""}${lastTm.at ? ` · ${fmtTime(lastTm.at)}` : ""}</div></div>
-  `;
+  
+    <div class="stat"><div class="label">流式输出</div><div class="value mono">${fmtNum(stream.writes_total || 0)} 次写 · ${fmtNum(stream.bytes_total || 0)} B</div>
+      <div class="sub">合并冲刷 ${fmtNum(stream.coalesce_flush_total || 0)} · keepalive ${fmtNum(stream.keepalives_total || 0)} · soft-gone ${fmtNum(stream.soft_gone_total || 0)}</div></div>`;
 }
 
 function renderMaintainer() {
@@ -1634,25 +1651,145 @@ function renderAccountsPage() {
 }
 
 function renderAccounts() {
-  return loadAccountsPage({ reset: false });
+  // Soft re-entry (menu / header refresh): keep table painted when we already have rows.
+  const silent = !!(accountsList && accountsList.length);
+  return loadAccountsPage({ reset: false, silent });
 }
 
 let _quotaCacheHydrated = false;
+
+// Unix seconds from probe/quota timestamps (sec or ms). 0 when missing/invalid.
+function accountUnixTs(v) {
+  if (v == null || v === "") return 0;
+  if (typeof v === "number" && Number.isFinite(v)) {
+    return v > 1e12 ? Math.floor(v / 1000) : Math.floor(v);
+  }
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (!s) return 0;
+    if (/^\d+(\.\d+)?$/.test(s)) {
+      const n = Number(s);
+      if (!Number.isFinite(n)) return 0;
+      return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+    }
+    const ms = Date.parse(s);
+    return Number.isFinite(ms) ? Math.floor(ms / 1000) : 0;
+  }
+  return 0;
+}
+
+function probeSnapTs(lp) {
+  if (!lp || typeof lp !== "object") return 0;
+  return accountUnixTs(lp.probed_at) || accountUnixTs(lp.at) || accountUnixTs(lp.updated_at);
+}
+
+function quotaSnapTs(q) {
+  if (!q || typeof q !== "object") return 0;
+  return accountUnixTs(q.fetched_at) || accountUnixTs(q.at) || accountUnixTs(q.updated_at);
+}
+
+// Keep the fresher of two snapshots by timestamp. Equal timestamps prefer left (server).
+function preferFresherSnap(serverSnap, localSnap, tsFn) {
+  if (!localSnap || typeof localSnap !== "object") return serverSnap || null;
+  if (!serverSnap || typeof serverSnap !== "object") return localSnap;
+  const lt = tsFn(localSnap);
+  const st = tsFn(serverSnap);
+  // Local live patch without ts still beats empty server; with equal/older ts keep server.
+  if (lt > st) return localSnap;
+  return serverSnap;
+}
+
+// Merge server /accounts rows with in-memory list so a just-finished probe/quota
+// is not clobbered by async SaveLastProbe / SaveQuotaSnapshot lag (or auto hot-refresh).
+function mergeAccountsFromServer(rawAccounts) {
+  const prevById = new Map((accountsList || []).map((a) => [accountIdKey(a.id), a]));
+  return (Array.isArray(rawAccounts) ? rawAccounts : []).map((a) => {
+    const id = accountIdKey(a && a.id);
+    const prev = id ? prevById.get(id) : null;
+    const serverPool = (a && a._pool) || { id: a && a.id };
+    const next = { ...a, _pool: { ...serverPool } };
+    if (!prev || !prev._pool) return next;
+    const prevPool = prev._pool;
+    const merged = { ...serverPool };
+
+    const preferLocalProbe = preferFresherSnap(serverPool.last_probe, prevPool.last_probe, probeSnapTs);
+    if (preferLocalProbe && preferLocalProbe === prevPool.last_probe) {
+      merged.last_probe = prevPool.last_probe;
+      if (prevPool.last_probe_status != null) merged.last_probe_status = prevPool.last_probe_status;
+      // Keep status derived from that fresher probe when server row is still lagging.
+      if (prevPool.pool_status != null && prevPool.pool_status !== serverPool.pool_status) {
+        const st = String(prevPool.pool_status);
+        if (st === "cooldown" || st === "normal" || st === "live" || st === "model_blocked") {
+          merged.pool_status = prevPool.pool_status;
+          if (prevPool.in_cooldown != null) merged.in_cooldown = prevPool.in_cooldown;
+          if (prevPool.cooldown_until !== undefined) merged.cooldown_until = prevPool.cooldown_until;
+          if (prevPool.cooldown_code !== undefined) merged.cooldown_code = prevPool.cooldown_code;
+          if (prevPool.cooldown_reason !== undefined) merged.cooldown_reason = prevPool.cooldown_reason;
+          if (prevPool.cooldown_model !== undefined) merged.cooldown_model = prevPool.cooldown_model;
+          if (prevPool.cooldown_count !== undefined) merged.cooldown_count = prevPool.cooldown_count;
+          if (prevPool.blocked_model_ids) merged.blocked_model_ids = prevPool.blocked_model_ids;
+          if (prevPool.blocked_models) merged.blocked_models = prevPool.blocked_models;
+          if (prevPool.last_error !== undefined) merged.last_error = prevPool.last_error;
+        }
+      }
+    }
+
+    const preferLocalQuota = preferFresherSnap(serverPool.last_quota, prevPool.last_quota, quotaSnapTs);
+    if (preferLocalQuota && preferLocalQuota === prevPool.last_quota) {
+      merged.last_quota = prevPool.last_quota;
+      if (prevPool.disabled_for_quota != null) merged.disabled_for_quota = prevPool.disabled_for_quota;
+      if (prevPool.disabled_reason !== undefined) merged.disabled_reason = prevPool.disabled_reason;
+      if (prevPool.quota_source !== undefined) merged.quota_source = prevPool.quota_source;
+      if (prevPool.quota_disabled_at !== undefined) merged.quota_disabled_at = prevPool.quota_disabled_at;
+      if (prevPool.pool_status === "quota_disabled" || prevPool.disabled_for_quota) {
+        merged.pool_status = "quota_disabled";
+        merged.disabled_for_quota = true;
+        if (prevPool.enabled != null) merged.enabled = prevPool.enabled;
+      } else if (
+        prevPool.disabled_for_quota === false
+        && (serverPool.disabled_for_quota === true || serverPool.pool_status === "quota_disabled")
+        && quotaSnapTs(prevPool.last_quota) >= quotaSnapTs(serverPool.last_quota)
+      ) {
+        // Healthy live quota beat a lagging exhausted DB row.
+        merged.disabled_for_quota = false;
+        if (prevPool.enabled != null) merged.enabled = prevPool.enabled;
+        if (merged.pool_status === "quota_disabled") {
+          merged.pool_status = prevPool.pool_status || "normal";
+        }
+        merged.disabled_reason = prevPool.disabled_reason ?? null;
+        merged.quota_source = prevPool.quota_source ?? null;
+      }
+    }
+
+    if (prevPool._clientBusy) merged._clientBusy = prevPool._clientBusy;
+    next._pool = { ...merged, id: a.id };
+    return next;
+  });
+}
+
+// Project last_quota into quotaCache without overwriting a fresher live result.
+function applyQuotaCacheFromAccounts(list) {
+  (list || []).forEach((a) => {
+    if (!a || a.id == null) return;
+    const id = a.id;
+    const lq = a._pool && a._pool.last_quota;
+    if (!lq || typeof lq !== "object") return;
+    const prev = quotaCache[id];
+    if (prev && typeof prev === "object" && quotaSnapTs(prev) > quotaSnapTs(lq)) {
+      return; // keep fresher live cache
+    }
+    quotaCache[id] = { ...lq, account_id: id, cached: true };
+  });
+}
+
 async function hydrateQuotaCacheFromDB() {
   // Page rows already embed last_quota from DB — just project them into quotaCache.
   // Do NOT call /accounts/quota?cached=1 (that scans the whole pool and freezes UI).
   try {
-    let changed = false;
-    (accountsList || []).forEach((a) => {
-      const lq = a && a._pool && a._pool.last_quota;
-      if (a && a.id && lq && typeof lq === "object") {
-        const prev = quotaCache[a.id];
-        quotaCache[a.id] = { ...lq, account_id: a.id, cached: true };
-        if (!prev) changed = true;
-      }
-    });
+    const beforeKeys = Object.keys(quotaCache || {}).length;
+    applyQuotaCacheFromAccounts(accountsList);
     _quotaCacheHydrated = true;
-    if (changed) {
+    if (Object.keys(quotaCache || {}).length !== beforeKeys) {
       try { renderAccountsPage(); } catch (_) {}
     }
   } catch (_) {
@@ -1660,12 +1797,8 @@ async function hydrateQuotaCacheFromDB() {
   }
 }
 
-async function loadAccountsPage({ reset = false } = {}) {
-  const tbody = $("accounts-tbody");
-  if (reset) accountsPage = 1;
-  if (tbody) tbody.innerHTML = `<tr><td colspan="9" class="g2a-muted">加载账号中…</td></tr>`;
-  accountsLoading = true;
-  const seq = ++accountsLoadSeq;
+function resolveAccountsListQuery() {
+  // Shared by loadAccountsPage + hotRefreshAccountsPage so filters/page size never diverge.
   const q = (accountsSearchQuery || ($("acc-search") && $("acc-search").value) || "").trim();
   accountsSearchQuery = q;
   if ($("acc-sort") && $("acc-sort").value) accountsSort = $("acc-sort").value;
@@ -1695,21 +1828,50 @@ async function loadAccountsPage({ reset = false } = {}) {
   const statusQs = accountsStatusFilter
     ? `&status=${encodeURIComponent(accountsStatusFilter)}`
     : "";
+  const path =
+    `/accounts?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}` +
+    `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}${statusQs}`;
+  return { q, sort, page, pageSize, path, ssoQs, statusQs };
+}
+
+// Clear a stuck "加载账号中…" if a prior load never finished (tab freeze / hung fetch).
+function accountsLoadWatchdog(maxMs = 45000) {
+  if (!accountsLoading) return false;
+  const started = accountsLoadingSince || 0;
+  if (started && (Date.now() - started) < maxMs) return false;
+  console.warn("[accounts] load watchdog: clearing stuck accountsLoading",
+    "ageMs", started ? (Date.now() - started) : "unknown", "seq", accountsLoadSeq);
+  accountsLoading = false;
+  accountsLoadingSince = 0;
+  // Bump seq so any still-pending older fetch is treated as stale.
+  accountsLoadSeq++;
+  return true;
+}
+
+async function loadAccountsPage({ reset = false, silent = false } = {}) {
+  // Soft-nav can leave a hung previous load with accountsLoading=true; recover first.
+  accountsLoadWatchdog(45000);
+  // Capture tbody only for the initial "加载中" paint. Soft-nav may replace DOM
+  // while we await /accounts — always re-query before writing error/empty states.
+  let tbody = $("accounts-tbody");
+  if (reset) accountsPage = 1;
+  // Only flash "加载中" when the table is empty or caller wants a full reload.
+  // Background re-sync / soft-nav re-entry keeps current rows visible until data lands.
+  const hasRows = !!(accountsList && accountsList.length);
+  if (tbody && (!silent || !hasRows)) {
+    tbody.innerHTML = `<tr><td colspan="9" class="g2a-muted">加载账号中…</td></tr>`;
+  }
+  accountsLoading = true;
+  accountsLoadingSince = Date.now();
+  const seq = ++accountsLoadSeq;
+  const { q, sort, page, pageSize, path } = resolveAccountsListQuery();
   try {
-    const data = await api(
-      `/accounts?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}` +
-      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}${statusQs}`
-    );
+    const data = await api(path);
     if (seq !== accountsLoadSeq) return;
     const rawAccounts = Array.isArray(data && data.accounts) ? data.accounts : [];
-    accountsList = rawAccounts.map((a) => ({ ...a, _pool: a._pool || { id: a.id } }));
-    // hydrate quota cache from DB-backed last_quota so UI shows cached status immediately
-    accountsList.forEach((a) => {
-      const lq = a && a._pool && a._pool.last_quota;
-      if (a && a.id && lq && typeof lq === "object") {
-        quotaCache[a.id] = { ...lq, account_id: a.id, cached: true };
-      }
-    });
+    // Merge with prior rows so a just-finished probe/quota is not wiped by async PG lag.
+    accountsList = mergeAccountsFromServer(rawAccounts);
+    applyQuotaCacheFromAccounts(accountsList);
     accountsTotal = Number(data.total != null ? data.total : (data.account_count || accountsList.length)) || 0;
     accountsTotalPages = Number(data.total_pages || Math.max(1, Math.ceil((accountsTotal || 0) / pageSize))) || 1;
     accountsPage = Number(data.page || page) || 1;
@@ -1726,16 +1888,21 @@ async function loadAccountsPage({ reset = false } = {}) {
       try { renderStats(); } catch (_) {}
     } else {
       // List response may omit pool on older builds — refresh /status for accurate counters.
+      // Re-check seq after this nested await so a newer load owns paint rights.
       try {
         const st = await api("/status");
+        if (seq !== accountsLoadSeq) return;
         statusCache = st || statusCache;
         if (st && st.pool) {
           if (statusCache) statusCache.pool = st.pool;
           if (dashCache) dashCache.pool = Object.assign({}, dashCache.pool || {}, st.pool);
         }
         try { renderStats(); } catch (_) {}
-      } catch (_) {}
+      } catch (_) {
+        if (seq !== accountsLoadSeq) return;
+      }
     }
+    if (seq !== accountsLoadSeq) return;
     // Remember durable store source so UI can show "数据库" instead of auth.json.
     window.__g2aAccountsStore = {
       source: data.store_source || data.store_backend || "file",
@@ -1771,16 +1938,26 @@ async function loadAccountsPage({ reset = false } = {}) {
         } catch (_) {}
       }
     }
-    accountsLoading = false;
     try { renderAccountStatusChips(); } catch (_) {}
     renderAccountsPage();
     hydrateQuotaCacheFromDB();
+    _lastAccountsHotAt = Date.now();
   } catch (e) {
     if (seq !== accountsLoadSeq) return;
-    accountsLoading = false;
     console.error("[accounts] load failed", e);
-    toast(e.message || "加载账号失败", false);
-    if (tbody) tbody.innerHTML = `<tr><td colspan="9" class="g2a-muted">加载失败：${esc(e.message || e)}</td></tr>`;
+    if (!silent) toast(e.message || "加载账号失败", false);
+    // Soft-nav may have swapped DOM during the failed fetch — re-query tbody.
+    tbody = $("accounts-tbody");
+    // Keep previous rows if this was a silent refresh and we already had data.
+    if (tbody && !(silent && accountsList && accountsList.length)) {
+      tbody.innerHTML = `<tr><td colspan="9" class="g2a-muted">加载失败：${esc(e.message || e)}</td></tr>`;
+    }
+  } finally {
+    // Stale seq must not clear a newer in-flight load (double-fetch race).
+    if (seq === accountsLoadSeq) {
+      accountsLoading = false;
+      accountsLoadingSince = 0;
+    }
   }
 }
 
@@ -2626,11 +2803,11 @@ async function refreshAllQuota(force = true) {
     }
     const ok = (data.ok_count != null ? data.ok_count : rows.filter(x => x && x.ok && !x.exhausted).length);
     toast(force ? `额度已刷新：可用 ${ok}/${data.count ?? rows.length}` : `已加载缓存额度：${rows.length} 条`, true);
-    // Frontend already painted from live results. Re-sync DB in background so we
-    // do not block the button/toast on a second full accounts page fetch.
+    // Frontend already painted from live results. Silent re-sync so we do not
+    // flash "加载中" or clobber fresher live quota cells while PG lags.
     if (force) {
       Promise.resolve().then(async () => {
-        try { await loadAccountsPage({ reset: false }); } catch (_) {}
+        try { await loadAccountsPage({ reset: false, silent: true }); } catch (_) {}
         try {
           const st = await api("/status");
           statusCache = st || statusCache;
@@ -2817,9 +2994,9 @@ async function runAccountProbe(accountId, model) {
     });
     try { renderAccountStatusChips(); } catch (_) {}
     try { renderStats(); } catch (_) {}
-    // Live patch already applied; re-sync DB in background (async SaveLastProbe may still land).
+    // Live patch already applied; silent re-sync (merge keeps fresher last_probe if PG lags).
     Promise.resolve().then(async () => {
-      try { await loadAccountsPage({ reset: false }); } catch (_) {}
+      try { await loadAccountsPage({ reset: false, silent: true }); } catch (_) {}
     });
   } catch (e) {
     setLogPanel("probe-result", "✗ " + e.message, { forceShow: true });
@@ -2877,9 +3054,9 @@ async function probeAccounts(ids, { confirmMany = true } = {}) {
     lines.splice(1, 0, `成功 ${okN} · 失败 ${badN} · 冷却 ${coolN}`);
     setLogPanel("probe-result", lines.join("\n"), { forceShow: true });
     toast(`批量测活：成功 ${okN} · 失败 ${badN} · 冷却 ${coolN}`, badN === 0);
-    // Live patches already painted; DB re-sync in background.
+    // Live patches already painted; silent DB re-sync (merge keeps fresher probes).
     Promise.resolve().then(async () => {
-      try { await loadAccountsPage({ reset: false }); } catch (_) {}
+      try { await loadAccountsPage({ reset: false, silent: true }); } catch (_) {}
       try {
         const st = await api("/status");
         statusCache = st || statusCache;
@@ -2986,7 +3163,7 @@ async function runProbeAll() {
     try { renderMaintainer(); } catch (_) {}
     try { renderStats(); } catch (_) {}
     try { await refreshOverviewStatus({ force: true, render: true }); } catch (_) {}
-    try { await loadAccountsPage({ reset: false }); } catch (_) {}
+    try { await loadAccountsPage({ reset: false, silent: true }); } catch (_) {}
   } catch (e) {
     setLogPanel("probe-result", "✗ " + (e.message || e), { forceShow: true });
     toast(e.message || "全部探测失败", false);
@@ -3007,62 +3184,70 @@ let _autoRefreshFailStreak = 0;
 let _lastAccountsHotAt = 0;
 let _accountsHotInFlight = false;
 
+// Shared manual refresh for accounts page (header 刷新 + 列表旁 刷新).
+// /status chips and list rows are independent: status failure must not block the list.
+async function refreshAccountsListUI({ toastOk = "", force = true } = {}) {
+  accountsLoadWatchdog(45000);
+  try {
+    _statusFetchedAt = 0;
+    statusCache = await api("/status");
+    _statusFetchedAt = Date.now();
+    if (window.G2A && G2A.state) G2A.state.status = statusCache;
+    try { renderAccountStatusChips(); } catch (_) {}
+    try { renderStats(); } catch (_) {}
+  } catch (e) {
+    if (e && e.status === 401) throw e;
+    console.warn("refreshAccountsListUI /status", e && (e.message || e));
+  }
+  if (typeof hotRefreshAccountsPage === "function") {
+    await hotRefreshAccountsPage({ force: !!force });
+  } else {
+    await loadAccountsPage({ reset: false, silent: !!(accountsList && accountsList.length) });
+  }
+  if (toastOk) toast(toastOk);
+}
+
 // Silent accounts hot-refresh: re-fetch current page from DB and patch rows
 // without flashing "加载账号中…" or resetting selection/scroll.
-async function hotRefreshAccountsPage() {
-  if (_accountsHotInFlight) return;
-  if (accountsLoading) return;
+async function hotRefreshAccountsPage({ force = false } = {}) {
+  // Unstick a hung full load so force refresh can proceed after tab freezes.
+  if (force) accountsLoadWatchdog(45000);
+  // Background ticks never stack; manual force never silently no-ops.
+  if (!force && (_accountsHotInFlight || accountsLoading)) return;
+  if (force && accountsLoading) {
+    // Full loader owns accountsLoading — piggy-back on its seq guard (silent keeps rows).
+    return loadAccountsPage({ reset: false, silent: true });
+  }
+  // force + only hot-inflight: wait briefly for the other hot pass, then continue
+  // so manual 刷新 never becomes a silent no-op after a stacked auto tick.
+  if (force && _accountsHotInFlight) {
+    const deadline = Date.now() + 2500;
+    while (_accountsHotInFlight && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (_accountsHotInFlight) {
+      return loadAccountsPage({ reset: false, silent: true });
+    }
+  }
   const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
   if (page !== "accounts" && page !== "overview") return;
   // overview may not have the table mounted
   if (page === "accounts" && !$("accounts-tbody")) return;
+  if (_accountsHotInFlight) {
+    if (!force) return;
+    return loadAccountsPage({ reset: false, silent: true });
+  }
   _accountsHotInFlight = true;
+  const hotSeq = accountsLoadSeq;
   try {
-    const q = (accountsSearchQuery || ($("acc-search") && $("acc-search").value) || "").trim();
-    accountsSearchQuery = q;
-    if ($("acc-sort") && $("acc-sort").value) accountsSort = $("acc-sort").value;
-    if ($("acc-filter-status") && $("acc-filter-status").value) {
-      accountsStatusFilter = $("acc-filter-status").value || accountsStatusFilter || "";
-    }
-    if (accountsStatusFilter) {
-      accountsSsoFilter = "";
-      if ($("acc-filter-sso") && $("acc-filter-sso").value) {
-        try { $("acc-filter-sso").value = ""; } catch (_) {}
-      }
-    } else if ($("acc-filter-sso")) {
-      accountsSsoFilter = $("acc-filter-sso").value || "";
-    }
-    const sort = accountsSort || "newest";
-    const pageSize = accountsPageSize || 25;
-    const pageNo = accountsPage || 1;
-    const ssoQs = (accountsSsoFilter === "1" || accountsSsoFilter === "0")
-      ? `&has_sso=${encodeURIComponent(accountsSsoFilter === "1" ? "true" : "false")}`
-      : "";
-    const statusQs = accountsStatusFilter
-      ? `&status=${encodeURIComponent(accountsStatusFilter)}`
-      : "";
-    const data = await api(
-      `/accounts?page=${encodeURIComponent(pageNo)}&page_size=${encodeURIComponent(pageSize)}` +
-      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}${statusQs}`
-    );
+    const { page: pageNo, pageSize, path } = resolveAccountsListQuery();
+    const data = await api(path);
+    // A newer full load started while we were in flight — let it own the paint.
+    if (hotSeq !== accountsLoadSeq) return;
     const rawAccounts = Array.isArray(data && data.accounts) ? data.accounts : [];
-    // Preserve in-flight busy labels: merge by id rather than wipe.
-    const prevById = new Map((accountsList || []).map((a) => [String(a.id), a]));
-    accountsList = rawAccounts.map((a) => {
-      const prev = prevById.get(String(a.id));
-      const next = { ...a, _pool: a._pool || { id: a.id } };
-      // Prefer fresher server pool fields; keep only ephemeral client flags if any.
-      if (prev && prev._pool && prev._pool._clientBusy) {
-        next._pool = { ...next._pool, _clientBusy: prev._pool._clientBusy };
-      }
-      return next;
-    });
-    accountsList.forEach((a) => {
-      const lq = a && a._pool && a._pool.last_quota;
-      if (a && a.id && lq && typeof lq === "object") {
-        quotaCache[a.id] = { ...lq, account_id: a.id, cached: true };
-      }
-    });
+    // Merge with prior rows (probe/quota live patches + ephemeral busy flags).
+    accountsList = mergeAccountsFromServer(rawAccounts);
+    applyQuotaCacheFromAccounts(accountsList);
     accountsTotal = Number(data.total != null ? data.total : (data.account_count || accountsList.length)) || 0;
     accountsTotalPages = Number(data.total_pages || Math.max(1, Math.ceil((accountsTotal || 0) / pageSize))) || 1;
     accountsPage = Number(data.page || pageNo) || 1;
@@ -3071,13 +3256,16 @@ async function hotRefreshAccountsPage() {
       if (dashCache) dashCache.pool = Object.assign({}, dashCache.pool || {}, data.pool);
       try { renderStats(); } catch (_) {}
     }
+    // Soft-nav may have swapped DOM while we awaited — re-check before paint.
+    if (page === "accounts" && !$("accounts-tbody")) return;
+    if (hotSeq !== accountsLoadSeq) return;
     try { renderAccountStatusChips(); } catch (_) {}
     try { renderAccountsPage(); } catch (_) {}
     _lastAccountsHotAt = Date.now();
   } catch (e) {
     if (e && e.status === 401) throw e;
-    // silent on transient errors
     console.warn("accounts hot refresh", e && (e.message || e));
+    if (force) throw e;
   } finally {
     _accountsHotInFlight = false;
   }
@@ -3136,9 +3324,10 @@ function startAutoUiRefresh() {
         }
         // Accounts page: silent DB re-sync so cooldown/quota/renew/model status stay live.
         if (page === "accounts") {
+          try { accountsLoadWatchdog(45000); } catch (_) {}
           try { renderAccountStatusChips(); } catch (_) {}
           // Hot-refresh rows every ~12s (interval is 8s; gate with timestamp).
-          if (!_accountsHotInFlight && (now - (_lastAccountsHotAt || 0)) > 12000) {
+          if (!_accountsHotInFlight && !accountsLoading && (now - (_lastAccountsHotAt || 0)) > 12000) {
             await hotRefreshAccountsPage();
           }
         }
@@ -4609,8 +4798,7 @@ function buildRegLogText(sessions, { batch = null, extraLines = [] } = {}) {
       }
     } else if (s && (s.log || s.output_tail)) {
       String(s.log || s.output_tail)
-        .split("
-")
+        .split("\n")
         .filter(Boolean)
         .slice(-8)
         .forEach((row) => timeline.push(`${email ? email + " " : ""}${row}`));
@@ -5088,7 +5276,9 @@ async function pollRegSession() {
       }
       await loadDashboard();
       // Accounts page total comes from /accounts — refresh like manual import does.
-      try { await loadAccountsPage({ reset: true }); } catch (_) {}
+      try { await afterAccountsIngested({ reset: true }); } catch (_) {
+        try { await loadAccountsPage({ reset: true }); } catch (__) {}
+      }
     } catch (_) {}
   } catch (_) {}
   } finally {
@@ -5658,6 +5848,27 @@ async function exportAllAccounts() {
   return runJsonExportJob({ mode: "all", buttonId: "btn-export" });
 }
 
+
+/** After any入库 path (JSON / SSO / device / reg): force list + chips to match DB. */
+async function afterAccountsIngested({ reset = true, silent = false } = {}) {
+  try {
+    _statusFetchedAt = 0;
+  } catch (_) {}
+  try {
+    if (typeof refreshAccountsListUI === "function") {
+      await refreshAccountsListUI({ force: true });
+      return;
+    }
+  } catch (e) {
+    console.warn("afterAccountsIngested refreshAccountsListUI", e);
+  }
+  try {
+    await loadAccountsPage({ reset: !!reset, silent: !!silent });
+  } catch (_) {
+    try { await loadDashboard(); } catch (__) {}
+  }
+}
+
 async function importJsonFiles() {
   return importAccountJsonFiles({
     inputId: "import-file",
@@ -5784,30 +5995,50 @@ async function importAccountJsonFiles({
       );
       if (input) input.value = "";
       if (nameLabelId && $(nameLabelId)) $(nameLabelId).textContent = "未选择文件";
-      try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+      try { await afterAccountsIngested({ reset: true }); } catch (_) { try { await loadDashboard(); } catch (__) {} }
       return;
     }
 
-    // Sync response (old backend): no job_id.
+        // Sync response (Go /admin/api/accounts/import-files is synchronous; no job_id).
     if (!started.job_id) {
-      const count = started.count || started.imported?.length || 0;
-      const parseErrors = started.parse_errors || 0;
+      const importedArr = Array.isArray(started.imported) ? started.imported : [];
+      const count = Number(
+        started.count != null ? started.count
+          : (started.success != null ? started.success : importedArr.length)
+      ) || importedArr.length || 0;
+      const parseErrors = Number(started.parse_errors || 0) || 0;
+      const fileResults = Array.isArray(started.file_results) ? started.file_results
+        : (Array.isArray(started.file_meta) ? started.file_meta : []);
+      const fileFail = fileResults.filter((x) => x && x.ok === false).length || parseErrors;
+      const okFiles = Math.max(0, files.length - fileFail);
+      // file_meta for log panel
+      const metaLines = fileResults.map((x, idx) => {
+        if (!x) return "";
+        const name = x.filename || x.name || `file#${x.index || idx + 1}`;
+        return `${x.ok === false ? "❌" : "✅"} ${name}${x.error ? " · " + x.error : (x.count != null ? " · " + x.count + " 条" : "")}`;
+      }).filter(Boolean);
       setJsonIoProgress({
         percent: 100,
-        label: started.message || "导入完成",
+        label: started.message || (count ? `导入完成：${count} 个账号` : "导入完成"),
+        detail: parseErrors ? `${parseErrors} 个文件解析失败` : (started.total_accounts != null ? `库内共 ${started.total_accounts}` : ""),
         done: files.length,
         total: files.length,
         success: count,
-        fail: parseErrors,
-        status: parseErrors ? "partial" : "done",
+        fail: fileFail,
+        status: (fileFail > 0 && count > 0) ? "partial" : (fileFail > 0 && count === 0 ? "error" : "done"),
       });
+      setLogPanel(
+        "json-io-result",
+        [started.message || `导入完成：${count} 个账号`, metaLines.length ? metaLines.join("\n") : ""].filter(Boolean).join("\n") || "—",
+        { forceShow: true }
+      );
       toast(
-        started.message || `导入完成：${count} 个账号` + (parseErrors ? `，${parseErrors} 个文件失败` : ""),
-        parseErrors === 0
+        started.message || `导入完成：${count} 个账号` + (fileFail ? `，${fileFail} 个文件失败` : ""),
+        count > 0 || fileFail === 0
       );
       if (input) input.value = "";
       if (nameLabelId && $(nameLabelId)) $(nameLabelId).textContent = "未选择文件";
-      try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+      try { await afterAccountsIngested({ reset: true }); } catch (_) { try { await loadDashboard(); } catch (__) {} }
       return;
     }
 
@@ -5840,7 +6071,7 @@ async function importAccountJsonFiles({
     );
     if (input) input.value = "";
     if (nameLabelId && $(nameLabelId)) $(nameLabelId).textContent = "未选择文件";
-    try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+    try { await afterAccountsIngested({ reset: true }); } catch (_) { try { await loadDashboard(); } catch (__) {} }
   } catch (e) {
     setJsonIoProgress({
       percent: 100,
@@ -5907,7 +6138,7 @@ function setSsoProgress({
     detailEl.textContent = parts.filter(Boolean).join(" · ") || "—";
   }
   if (wrap) {
-    wrap.classList.toggle("is-done", status === "done");
+    wrap.classList.toggle("is-done", status === "done" || status === "partial");
     wrap.classList.toggle("is-error", status === "error");
   }
 }
@@ -6091,21 +6322,26 @@ async function importSsoCookies() {
     // Backward-compat: old sync response already has results.
     if (!started.job_id && Array.isArray(started.results)) {
       const rows = formatSsoResultRows(started.results || []);
+      const successN = Number(started.success || 0) || 0;
+      const failN = Number(started.fail || 0) || 0;
+      const st = started.ok === false && successN === 0 ? "error" : (failN > 0 ? "partial" : "done");
       setSsoProgress({
         percent: 100,
         label: started.message || "SSO 导入完成",
         done: started.total || lines.length,
         total: started.total || lines.length,
-        success: started.success || 0,
-        fail: started.fail || 0,
-        status: started.ok === false ? "error" : "done",
+        success: successN,
+        fail: failN,
+        status: st,
       });
       setLogPanel("sso-result", `${started.message || ""}\n${rows.join("\n")}`, { forceShow: true });
-      toast(started.message || `SSO 导入完成：${started.success || 0}/${started.total || lines.length}`, !!started.ok);
-      if (ta) ta.value = "";
-      if (fileInput) fileInput.value = "";
-      if ($("sso-file-name")) $("sso-file-name").textContent = "未选择文件";
-      try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+      toast(started.message || `SSO 导入完成：${successN}/${started.total || lines.length}`, successN > 0);
+      if (successN > 0) {
+        if (ta) ta.value = "";
+        if (fileInput) fileInput.value = "";
+        if ($("sso-file-name")) $("sso-file-name").textContent = "未选择文件";
+      }
+      try { await afterAccountsIngested({ reset: true }); } catch (_) { try { await loadDashboard(); } catch (__) {} }
       return;
     }
 
@@ -6139,41 +6375,55 @@ async function importSsoCookies() {
         );
       }
       const st = String((finalJob && finalJob.status) || "");
-      if (st === "done" || st === "error") break;
+      if (st === "done" || st === "partial" || st === "error") break;
       await new Promise((resolve) => setTimeout(resolve, 900));
     }
 
-    if (!finalJob || (finalJob.status !== "done" && finalJob.status !== "error")) {
+    if (!finalJob || !["done", "partial", "error"].includes(String(finalJob.status || ""))) {
       // One last fetch
       try { finalJob = await pollSsoImportJob(jobId, { totalHint: lines.length }); } catch (_) {}
     }
 
     const st = String((finalJob && finalJob.status) || "");
-    if (st !== "done" && st !== "error") {
+    if (st !== "done" && st !== "partial" && st !== "error") {
       throw new Error("SSO 导入超时，请稍后刷新账号列表确认是否已部分入库");
     }
 
     const rows = formatSsoResultRows((finalJob && finalJob.results) || []);
+    const successN = Number((finalJob && finalJob.success) || 0) || 0;
+    const failN = Number((finalJob && finalJob.fail) || 0) || 0;
     const msg =
       (finalJob && finalJob.message) ||
-      `SSO 导入完成：${finalJob.success || 0} 成功, ${finalJob.fail || 0} 失败`;
+      `SSO 导入完成：${successN} 成功, ${failN} 失败`;
     setSsoProgress({
       percent: 100,
       label: msg,
       detail: finalJob.job_id ? `job_id: ${finalJob.job_id}` : "",
       done: finalJob.total || lines.length,
       total: finalJob.total || lines.length,
-      success: finalJob.success || 0,
-      fail: finalJob.fail || 0,
-      status: st === "error" ? "error" : "done",
+      success: successN,
+      fail: failN,
+      status: st === "error" && successN === 0 ? "error" : (failN > 0 ? "partial" : "done"),
     });
     setLogPanel("sso-result", `${msg}\n${rows.join("\n")}`, { forceShow: true });
-    toast(msg, st === "done" && !(finalJob.fail > 0 && finalJob.success === 0));
-    if (st === "done") {
-      if (ta) ta.value = "";
-      if (fileInput) fileInput.value = "";
-      if ($("sso-file-name")) $("sso-file-name").textContent = "未选择文件";
-      try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+    // Green when any success; red on total failure / error with zero imports.
+    toast(msg, successN > 0);
+    // Refresh list whenever something landed (done/partial with success).
+    if (successN > 0 || st === "done" || st === "partial") {
+      if (successN > 0) {
+        if (ta) ta.value = "";
+        if (fileInput) fileInput.value = "";
+        if ($("sso-file-name")) $("sso-file-name").textContent = "未选择文件";
+      }
+      try {
+        if (typeof refreshAccountsListUI === "function") {
+          await refreshAccountsListUI({ force: true });
+        } else {
+          await loadAccountsPage({ reset: true });
+        }
+      } catch (_) {
+        try { await loadDashboard(); } catch (__) {}
+      }
     }
   } catch (e) {
     showSsoProgress(true);
@@ -6319,7 +6569,7 @@ async function pollDeviceSession() {
       clearInterval(devicePollTimer);
       devicePollTimer = null;
       // only refresh accounts list page, not whole dashboard if possible
-      try { await loadAccountsPage({ reset: false }); } catch (_) { try { await loadDashboard(); } catch(__){} }
+      try { await afterAccountsIngested({ reset: false }); } catch (_) { try { await loadDashboard(); } catch(__){} }
     } else if (s.status === "error" || s.status === "failed" || s.status === "expired") {
       toast(s.error || s.message || "登录失败", false);
       clearInterval(devicePollTimer);
@@ -6340,52 +6590,41 @@ on("btn-login-device", "onclick", () => startDeviceLogin());
 on("btn-poll-device", "onclick", () => pollDeviceSession());
 on("btn-copy-device", "onclick", () => copyDeviceCode());
 
-if ($("import-file")) {
-  on("import-file", "onchange", () => {    const files = $("import-file").files;
-    const label = $("import-file-name");
-    if (label) {
-      if (!files || !files.length) {
-        label.textContent = "未选择文件";
-      } else if (files.length === 1) {
-        label.textContent = `已选择：${files[0].name}（${(files[0].size / 1024).toFixed(1)} KB）`;
-      } else {
-        const totalKb = Array.from(files).reduce((s, f) => s + f.size, 0) / 1024;
-        label.textContent = `已选择 ${files.length} 个文件（共 ${totalKb.toFixed(1)} KB）`;
-      }
-    }
-  });
-}
+// Module-level fallbacks (first paint). Soft-nav rebinds the same ids in rebindPageControls.
+on("import-file", "onchange", () => {
+  const files = $("import-file") && $("import-file").files;
+  const label = $("import-file-name");
+  if (!label) return;
+  if (!files || !files.length) label.textContent = "未选择文件";
+  else if (files.length === 1) label.textContent = `已选择：${files[0].name}（${(files[0].size / 1024).toFixed(1)} KB）`;
+  else {
+    const totalKb = Array.from(files).reduce((s, f) => s + f.size, 0) / 1024;
+    label.textContent = `已选择 ${files.length} 个文件（共 ${totalKb.toFixed(1)} KB）`;
+  }
+});
 on("btn-import", "onclick", () => importJsonFiles());
 on("btn-import-sso", "onclick", () => importSsoCookies());
 on("btn-export-sso", "onclick", () => exportRegistrationSso());
-if ($("sso-file")) {
-  on("sso-file", "onchange", () => {    const f = $("sso-file").files && $("sso-file").files[0];
-    const label = $("sso-file-name");
-    if (label) {
-      label.textContent = f
-        ? `已选择：${f.name}（${(f.size / 1024).toFixed(1)} KB）`
-        : "未选择文件";
-    }
-  });
-}
+on("sso-file", "onchange", () => {
+  const f = $("sso-file") && $("sso-file").files && $("sso-file").files[0];
+  const label = $("sso-file-name");
+  if (!label) return;
+  label.textContent = f ? `已选择：${f.name}（${(f.size / 1024).toFixed(1)} KB）` : "未选择文件";
+});
 if ($("btn-export")) {
   on("btn-export", "onclick", () => exportAllAccounts());
 }
 
-on("btn-refresh-acc", "onclick", async () => {  try {
-    _statusFetchedAt = 0;
-    statusCache = await api("/status");
-    _statusFetchedAt = Date.now();
-    if (window.G2A && G2A.state) G2A.state.status = statusCache;
-    try { renderAccountStatusChips(); } catch (_) {}
-    try { renderStats(); } catch (_) {}
-    if (typeof hotRefreshAccountsPage === "function") {
-      await hotRefreshAccountsPage();
+// Module-level fallback; soft-nav rebind overwrites via rebindPageControls → refreshAccountsListUI.
+on("btn-refresh-acc", "onclick", async () => {
+  try {
+    if (typeof refreshAccountsListUI === "function") {
+      await refreshAccountsListUI({ toastOk: "已热更新", force: true });
     } else {
-      await loadAccountsPage({ reset: false });
+      await loadAccountsPage({ reset: false, silent: !!(accountsList && accountsList.length) });
+      toast("已热更新");
     }
     if (loginSessionId) await pollDeviceSession();
-    toast("已热更新");
   } catch (e) { toast(e.message, false); }
 });
 on("btn-logout-cli", "onclick", async () => {  if (!confirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）")) return;
@@ -6553,11 +6792,11 @@ async function testCliproxyapiConnection() {
     const msg = ok
       ? (r.test && r.test.message) || r.message || "连接成功"
       : (r && r.test && r.test.error) || (r && r.error) || "失败";
-    toast(msg, !ok);
+    toast(msg, ok);
     return r;
   } catch (e) {
     if (pre) pre.textContent = String(e.message || e);
-    toast(e.message || String(e), true);
+    toast(e.message || String(e), false);
     throw e;
   }
 }
@@ -6587,7 +6826,7 @@ async function pushAccountsToCliproxyapi({ all = false } = {}) {
     const total = r && r.total != null ? r.total : ok + fail;
     toast(
       r.message || `CLIProxyAPI 导入完成：成功 ${ok} / 失败 ${fail} / 共 ${total}`,
-      fail !== 0
+      fail === 0
     );
     if (fail && r && Array.isArray(r.results)) {
       const firstErr = r.results.find((x) => x && !x.ok);
@@ -6683,11 +6922,11 @@ async function testSub2apiConnection() {
     const r = await api("/settings/sub2api/test", { method: "POST", body: "{}" });
     if (pre) pre.textContent = JSON.stringify(r, null, 2);
     if (r && Array.isArray(r.groups)) renderSub2apiGroups(r.groups);
-    toast(r && r.ok ? `连接成功，${r.group_count || 0} 个分组` : (r && r.error) || "失败", !(r && r.ok));
+    toast(r && r.ok ? `连接成功，${r.group_count || 0} 个分组` : (r && r.error) || "失败", !!(r && r.ok));
     return r;
   } catch (e) {
     if (pre) pre.textContent = String(e.message || e);
-    toast(e.message || String(e), true);
+    toast(e.message || String(e), false);
     throw e;
   }
 }
@@ -6709,7 +6948,7 @@ async function loadSub2apiGroups() {
     return r;
   } catch (e) {
     if (pre) pre.textContent = String(e.message || e);
-    toast(e.message || String(e), true);
+    toast(e.message || String(e), false);
     throw e;
   }
 }
@@ -6723,7 +6962,7 @@ async function createSub2apiGroup() {
     body: JSON.stringify({ name, platform: "grok", set_default: true }),
   });
   if (r && r.config) fillSub2apiForm(r.config);
-  toast(r && r.ok ? `分组已创建 #${(r.group && r.group.id) || "?"}` : "创建失败", !(r && r.ok));
+  toast(r && r.ok ? `分组已创建 #${(r.group && r.group.id) || "?"}` : "创建失败", !!(r && r.ok));
   try { await loadSub2apiGroups(); } catch (_) {}
   return r;
 }
@@ -6754,7 +6993,7 @@ async function pushAccountsToSub2api({ all = false } = {}) {
     const ok = r && r.success != null ? r.success : 0;
     const fail = r && r.failed != null ? r.failed : 0;
     const total = r && r.total != null ? r.total : ok + fail;
-    toast(`sub2api 导入完成：成功 ${ok} / 失败 ${fail} / 共 ${total}`, fail !== 0);
+    toast(`sub2api 导入完成：成功 ${ok} / 失败 ${fail} / 共 ${total}`, fail === 0);
     if (fail && r && Array.isArray(r.results)) {
       const firstErr = r.results.find((x) => x && !x.ok);
       if (firstErr) console.warn("sub2api push sample error", firstErr);
@@ -6816,7 +7055,7 @@ async function exportSub2apiFormat() {
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
     toast(`已导出 sub2api-data：${count} 个账号（可在 sub2api「导入数据」中使用）`);
   } catch (e) {
-    toast(e.message || String(e), true);
+    toast(e.message || String(e), false);
   }
 }
 
@@ -6872,14 +7111,14 @@ async function exportCliproxyapiFormat() {
       `已导出 CLIProxyAPI：${count} 个账号（可再「导入文件」回本系统，或拆成单文件放进 CPA auth 目录）`
     );
   } catch (e) {
-    toast(e.message || String(e), true);
+    toast(e.message || String(e), false);
   }
 }
 
 function bindSub2apiUi() {
   on("btn-sub2api-test", "onclick", () => { testSub2apiConnection().catch(() => {}); });
-  on("btn-sub2api-load-groups", "onclick", () => { loadSub2apiGroups().catch((e) => toast(e.message || String(e), true)); });
-  on("btn-sub2api-create-group", "onclick", () => { createSub2apiGroup().catch((e) => toast(e.message || String(e), true)); });
+  on("btn-sub2api-load-groups", "onclick", () => { loadSub2apiGroups().catch((e) => toast(e.message || String(e), false)); });
+  on("btn-sub2api-create-group", "onclick", () => { createSub2apiGroup().catch((e) => toast(e.message || String(e), false)); });
   // Checking "注册后自动入库" also turns on the integration (push requires enabled).
   on("set-sub2api-auto-push-register", "onchange", () => {
     const auto = $("set-sub2api-auto-push-register");

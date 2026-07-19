@@ -147,27 +147,45 @@
   <div class="g2a-card-head">
     <div>
       <h3>修改管理员密码</h3>
-      <p>密码哈希写入数据库（hybrid 的 PostgreSQL）。环境变量 <code>GROK2API_ADMIN_PASSWORD</code> 仅用于<strong>首次</strong>无密码时自动导入，之后鉴权以数据库为准。</p>
+      <p>密码哈希写入数据库（hybrid 的 PostgreSQL）。环境变量 <code>GROK2API_ADMIN_PASSWORD</code> 仅用于<strong>首次</strong>无密码时自动导入，之后鉴权以数据库为准。当前密码<strong>不会</strong>下发到前端，须手动输入。</p>
     </div>
     <span id="pwd-env-pill" class="g2a-tag">—</span>
   </div>
-  <div class="g2a-form-grid" style="display:grid;gap:12px;max-width:520px">
+  <!--
+    Never prefill admin passwords. Use a real <form> with autocomplete=off and
+    non-login field names so browsers do not inject the saved admin password
+    into "当前密码". Values are always typed by the user.
+  -->
+  <form id="form-change-admin-password" class="g2a-form-grid" style="display:grid;gap:12px;max-width:520px" autocomplete="off" onsubmit="return false;">
+    <!-- decoy fields: absorb browser password-manager autofill -->
+    <input type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true"
+      style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0" value="" />
+    <input type="password" name="password" autocomplete="new-password" tabindex="-1" aria-hidden="true"
+      style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0" value="" />
     <div class="g2a-field">
       <label for="set-cur-password">当前密码</label>
-      <input id="set-cur-password" type="password" class="g2a-input" autocomplete="current-password" placeholder="当前管理员密码" />
+      <input id="set-cur-password" name="g2a_admin_current_pw" type="password" class="g2a-input"
+        autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other"
+        readonly onfocus="this.removeAttribute('readonly')"
+        placeholder="请手动输入当前管理员密码" value="" />
+      <div class="g2a-muted" style="margin-top:4px">不会自动填入；请自行输入当前密码后再设新密码。</div>
     </div>
     <div class="g2a-field">
       <label for="set-new-password">新密码</label>
-      <input id="set-new-password" type="password" class="g2a-input" autocomplete="new-password" placeholder="至少 4 位" minlength="4" />
+      <input id="set-new-password" name="g2a_admin_new_pw" type="password" class="g2a-input"
+        autocomplete="new-password" data-lpignore="true" data-1p-ignore="true"
+        placeholder="至少 4 位" minlength="4" value="" />
     </div>
     <div class="g2a-field">
       <label for="set-confirm-password">确认新密码</label>
-      <input id="set-confirm-password" type="password" class="g2a-input" autocomplete="new-password" placeholder="再输入一次" minlength="4" />
+      <input id="set-confirm-password" name="g2a_admin_confirm_pw" type="password" class="g2a-input"
+        autocomplete="new-password" data-lpignore="true" data-1p-ignore="true"
+        placeholder="再输入一次" minlength="4" value="" />
     </div>
     <div class="g2a-actions">
       <button type="button" class="g2a-btn g2a-btn-primary" id="btn-change-password">更新密码</button>
     </div>
-  </div>
+  </form>
 </section>
 
 <section class="g2a-card">
@@ -418,7 +436,7 @@
     </div>
     <div class="g2a-field">
       <label class="g2a-check"><input type="checkbox" id="set-sub2api-auto-push-register" /> 注册成功后自动入库 sub2api</label>
-      <div class="g2a-muted" style="margin-top:4px">协议注册导入本地后立刻推送到上方分组；需同时启用 sub2api 并填好 URL/登录</div>
+      <div class="g2a-muted" style="margin-top:4px">勾选后会<strong>同时启用</strong> sub2api 导入；协议注册入库本地后立刻推送到上方分组（需填好 URL/登录/分组）。点「保存设置」后生效。</div>
     </div>
     <div class="g2a-field">
       <label for="set-sub2api-concurrency">推送并发</label>
@@ -487,7 +505,7 @@
     </div>
     <div class="g2a-field">
       <label class="g2a-check"><input type="checkbox" id="set-cliproxyapi-auto-push-register" /> 注册成功后自动入库 CPA</label>
-      <div class="g2a-muted" style="margin-top:4px">协议注册导入本地后立刻推送到 CPA；需同时启用并填好 URL / Key</div>
+      <div class="g2a-muted" style="margin-top:4px">勾选后会<strong>同时启用</strong> CLIProxyAPI 导入；协议注册入库本地后立刻推送到 CPA（需填好 URL / Management Key）。点「保存设置」后生效。</div>
     </div>
     <div class="g2a-field">
       <label for="set-cliproxyapi-concurrency">推送并发</label>
@@ -535,9 +553,9 @@
     </div>
   </div>
   <script src="/static/dist/utils.360f09cd20.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/api.4fde34e0be.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.fdbd666ef4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.6c83eeb57d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

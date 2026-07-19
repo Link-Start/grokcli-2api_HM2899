@@ -60,9 +60,10 @@ type AffinityStore interface {
 }
 
 type ChatRequest struct {
-	Model  string         `json:"model"`
-	Stream bool           `json:"stream"`
-	Raw    map[string]any `json:"-"`
+	Model     string         `json:"model"`
+	Stream    bool           `json:"stream"`
+	Raw       map[string]any `json:"-"`
+	UserAgent string         `json:"-"` // optional; Codex auto-compact threshold
 }
 
 type StreamFrame struct {
@@ -141,7 +142,7 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		return ChatResult{}, err
 	}
 	accounts := upstreamAccounts(chain)
-	body, prep := PrepareUpstreamBodyDetailed(request.Raw)
+	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
 	// Avoid a second Redis GET on the TTFT hot path.
@@ -231,7 +232,7 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 		return StreamOpen{}, err
 	}
 	accounts := upstreamAccounts(chain)
-	body, prep := PrepareUpstreamBodyDetailed(request.Raw)
+	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
 	// Avoid a second Redis GET on the TTFT hot path.
@@ -867,9 +868,26 @@ func normalizeOutboundToolCalls(calls []map[string]any, shellArgKeys map[string]
 			}
 		}
 		// Live: strict; force: CompleteJSON (after coerce already applied).
+		// Force-finish: if still incomplete, accept non-empty JSON object salvage so
+		// clients do not see half-open tool_use ("Tool use interrupted").
 		if force {
 			if !toolcall.CompleteJSON(args, name) {
-				continue
+				args2 := strings.TrimSpace(args)
+				okSalvage := false
+				if args2 != "" && (args2[0] == '{' || args2[0] == '[') {
+					var raw any
+					if json.Unmarshal([]byte(args2), &raw) == nil {
+						switch v := raw.(type) {
+						case map[string]any:
+							okSalvage = len(v) > 0
+						case []any:
+							okSalvage = len(v) > 0
+						}
+					}
+				}
+				if !okSalvage {
+					continue
+				}
 			}
 		} else if !toolcall.CompleteJSONStrict(args, name) {
 			continue
@@ -953,11 +971,19 @@ type ChatToolStreamAssembler struct {
 	toolCalls    []map[string]any
 	functionCall map[string]any
 	emitted      map[int]bool
+	// clientAcked: true only after the tool frame Write succeeded. Soft write
+	// failures leave emitted=true but unacked so RequeueUnacked can re-emit
+	// complete tool_calls (Claude Code "Tool use interrupted").
+	clientAcked map[int]bool
+	// pendingAcks: indexes framed in the last emitReadyToolFrames call.
+	pendingAcks  []int
 	finishReason any
 	usage        any
 	// finished is set after a finish_reason frame is produced so soft-disconnect
 	// force-finish does not emit a second terminal chunk.
 	finished bool
+	// finishedAcked: true only after finish_reason Write succeeded.
+	finishedAcked bool
 	// shellArgKeys maps tool name → preferred client shell arg key ("cmd" or "command").
 	// Empty/nil defaults shell-family tools to "cmd" (Codex schema).
 	shellArgKeys map[string]string
@@ -966,7 +992,7 @@ type ChatToolStreamAssembler struct {
 }
 
 func NewChatToolStreamAssembler() *ChatToolStreamAssembler {
-	return &ChatToolStreamAssembler{emitted: map[int]bool{}, shellArgKeys: map[string]string{}}
+	return &ChatToolStreamAssembler{emitted: map[int]bool{}, clientAcked: map[int]bool{}, shellArgKeys: map[string]string{}}
 }
 
 // SetShellArgKeys configures client-facing shell parameter names (Codex: "cmd").
@@ -1076,6 +1102,8 @@ func (a *ChatToolStreamAssembler) Finish() []map[string]any {
 	if a == nil {
 		return nil
 	}
+	// Soft write may have left unacked tools; requeue before force-finish.
+	a.RequeueUnacked()
 	return a.emitReadyToolFrames(true)
 }
 
@@ -1095,6 +1123,7 @@ func (a *ChatToolStreamAssembler) EmittedAny() bool {
 // FinishReasonFrame returns a terminal finish_reason chunk once. Soft-disconnect
 // and [DONE] both call this; a nil return means already finished (or no tools).
 func (a *ChatToolStreamAssembler) FinishReasonFrame() map[string]any {
+	// Idempotent unless RequeueUnacked cleared finished after soft write.
 	if a == nil || a.finished {
 		return nil
 	}
@@ -1103,6 +1132,117 @@ func (a *ChatToolStreamAssembler) FinishReasonFrame() map[string]any {
 		return nil
 	}
 	return a.finishFrame()
+}
+
+// AckPayload marks tools whose index/id appear in a successfully written JSON payload,
+// and finish_reason when present.
+func (a *ChatToolStreamAssembler) AckPayload(payload string) {
+	if a == nil || payload == "" {
+		return
+	}
+	if a.clientAcked == nil {
+		a.clientAcked = map[int]bool{}
+	}
+	if a.emitted == nil {
+		a.emitted = map[int]bool{}
+	}
+	if strings.Contains(payload, "finish_reason") && a.finished {
+		a.finishedAcked = true
+	}
+	if !strings.Contains(payload, "tool_calls") && !strings.Contains(payload, "function_call") {
+		return
+	}
+	for _, idx := range a.pendingAcks {
+		// Best-effort: if payload has tool_calls/function_call, ack pending in order.
+		// Chat frames usually carry one batch of ready tools.
+		a.clientAcked[idx] = true
+	}
+	// Also ack any emitted tool whose id appears in payload.
+	for i, call := range a.toolCalls {
+		if !a.emitted[i] || a.clientAcked[i] {
+			continue
+		}
+		if id, _ := call["id"].(string); id != "" && strings.Contains(payload, id) {
+			a.clientAcked[i] = true
+		}
+	}
+	if a.emitted[-1] && !a.clientAcked[-1] && strings.Contains(payload, "function_call") {
+		a.clientAcked[-1] = true
+	}
+	// Drop acked from pending
+	kept := a.pendingAcks[:0]
+	for _, idx := range a.pendingAcks {
+		if !a.clientAcked[idx] {
+			kept = append(kept, idx)
+		}
+	}
+	a.pendingAcks = kept
+}
+
+// RequeueUnacked rolls back framed-but-unacked tools so Finish can re-emit them.
+func (a *ChatToolStreamAssembler) RequeueUnacked() {
+	if a == nil {
+		return
+	}
+	if a.clientAcked == nil {
+		a.clientAcked = map[int]bool{}
+	}
+	if a.emitted == nil {
+		a.emitted = map[int]bool{}
+	}
+	if a.finished && !a.finishedAcked {
+		a.finished = false
+	}
+	for idx, em := range a.emitted {
+		if !em || a.clientAcked[idx] {
+			continue
+		}
+		a.emitted[idx] = false
+	}
+	a.pendingAcks = a.pendingAcks[:0]
+}
+
+// NeedsFinishRetry reports soft-fail recovery still has work.
+func (a *ChatToolStreamAssembler) NeedsFinishRetry() bool {
+	if a == nil {
+		return false
+	}
+	if a.finished && !a.finishedAcked {
+		return true
+	}
+	for idx, em := range a.emitted {
+		if em && !a.clientAcked[idx] {
+			return true
+		}
+	}
+	// Pending complete tools never framed
+	if a.Holding() {
+		for i := range a.toolCalls {
+			if !a.emitted[i] {
+				return true
+			}
+		}
+		if a.functionCall != nil && !a.emitted[-1] {
+			return true
+		}
+	}
+	return false
+}
+
+// HasUnacked reports framed-but-unacked tools or terminal.
+func (a *ChatToolStreamAssembler) HasUnacked() bool {
+	if a == nil {
+		return false
+	}
+	if a.finished && !a.finishedAcked {
+		return true
+	}
+	for idx, em := range a.emitted {
+		if em && !a.clientAcked[idx] {
+			return true
+		}
+	}
+	return len(a.pendingAcks) > 0
 }
 
 func (a *ChatToolStreamAssembler) mergeToolCalls(calls []map[string]any) {
@@ -1126,6 +1266,8 @@ func (a *ChatToolStreamAssembler) mergeFunctionCall(call map[string]any) {
 }
 
 func (a *ChatToolStreamAssembler) emitReadyToolFrames(force bool) []map[string]any {
+	// Fresh pending batch for this emit.
+	a.pendingAcks = a.pendingAcks[:0]
 	// Live path (force=false): EffectiveJSON only — do not invent missing new_string.
 	// Force-finish (force=true / non-stream collector): CoerceCompleteJSON fills
 	// delete-match defaults so incomplete path+old still emit at stream end.
@@ -1141,11 +1283,14 @@ func (a *ChatToolStreamAssembler) emitReadyToolFrames(force bool) []map[string]a
 		if raw, ok := numberToInt64(call["index"]); ok {
 			idx = int(raw)
 		}
-		if a.emitted[idx] {
+		if a.emitted[idx] && a.clientAcked[idx] {
 			continue
 		}
 		// Only emit when force or arguments complete (already filtered by normalize).
+		// Mark framed but not acked — soft write can RequeueUnacked and re-emit.
 		a.emitted[idx] = true
+		a.clientAcked[idx] = false
+		a.pendingAcks = append(a.pendingAcks, idx)
 		ready = append(ready, call)
 	}
 	var frames []map[string]any
@@ -1165,8 +1310,10 @@ func (a *ChatToolStreamAssembler) emitReadyToolFrames(force bool) []map[string]a
 		frames = append(frames, payload)
 	}
 	if force {
-		if fn := normalizeOutboundFunctionCall(a.functionCall, a.shellArgKeys, a.allowedTools); fn != nil && !a.emitted[-1] {
+		if fn := normalizeOutboundFunctionCall(a.functionCall, a.shellArgKeys, a.allowedTools); fn != nil && !(a.emitted[-1] && a.clientAcked[-1]) {
 			a.emitted[-1] = true
+			a.clientAcked[-1] = false
+			a.pendingAcks = append(a.pendingAcks, -1)
 			payload := a.baseChunk()
 			payload["choices"] = []any{map[string]any{
 				"index":         0,
@@ -1180,6 +1327,7 @@ func (a *ChatToolStreamAssembler) emitReadyToolFrames(force bool) []map[string]a
 }
 
 func (a *ChatToolStreamAssembler) finishFrame() map[string]any {
+	// Idempotent unless RequeueUnacked cleared finished after soft write.
 	if a.finished {
 		return nil
 	}

@@ -309,3 +309,23 @@ func TestReadSSEWithIdleKeepalive(t *testing.T) {
 		t.Fatalf("expected keepalive idle ticks, got %d", idleN)
 	}
 }
+
+func TestReadSSEMultiLineData(t *testing.T) {
+	// SSE multi-data lines must join with newline.
+	src := "data: line1\ndata: line2\n\ndata: [DONE]\n\n"
+	var got []string
+	err := ReadSSE(strings.NewReader(src), func(event Event) error {
+		if event.Done {
+			got = append(got, "[DONE]")
+			return nil
+		}
+		got = append(got, string(event.Data))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "line1\nline2" || got[1] != "[DONE]" {
+		t.Fatalf("got %#v", got)
+	}
+}

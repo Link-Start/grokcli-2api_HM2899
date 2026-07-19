@@ -121,9 +121,16 @@ func Completion(messageID, model, content, reasoning, finish string, calls []Too
 
 func event(name string, payload any) string {
 	encoded, _ := json.Marshal(payload)
-	return fmt.Sprintf("event: %s\ndata: %s\n\n", name, encoded)
+	// Hot path: avoid fmt.Sprintf on every Anthropic SSE frame.
+	var b strings.Builder
+	b.Grow(16 + len(name) + len(encoded))
+	b.WriteString("event: ")
+	b.WriteString(name)
+	b.WriteString("\ndata: ")
+	b.Write(encoded)
+	b.WriteString("\n\n")
+	return b.String()
 }
-
 func TerminalError(message, errorType string) []string {
 	if errorType == "" {
 		errorType = "api_error"
@@ -142,17 +149,22 @@ func TerminalError(message, errorType string) []string {
 			"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
 			"usage": map[string]any{"output_tokens": 0},
 		}),
-		event("message_stop", map[string]any{"type": "message_stop"}),
+		messageStopFrame,
 	}
 }
 
+// Cached static SSE frames — Ping/CommentKeepalive are hot on every idle tick
+// and pending-tool drip; re-marshaling the same JSON every call was pure waste.
+var (
+	cachedPing             = event("ping", map[string]any{"type": "ping"})
+	cachedCommentKeepalive = ": keepalive\n\n"
+	// messageStopFrame is used by Finish / TerminalError hot paths.
+	messageStopFrame = event("message_stop", map[string]any{"type": "message_stop"})
+)
+
 // Ping is the Anthropic SSE keepalive used during long thinking / tool-prep gaps.
-func Ping() string {
-	return event("ping", map[string]any{"type": "ping"})
-}
+func Ping() string { return cachedPing }
 
 // CommentKeepalive is a pure SSE comment for reverse proxies that ignore named
 // ping events but still need idle traffic.
-func CommentKeepalive() string {
-	return ": keepalive\n\n"
-}
+func CommentKeepalive() string { return cachedCommentKeepalive }

@@ -38,6 +38,9 @@ var unsupportedUpstreamParams = map[string]bool{
 	"search_parameters":        true,
 	"web_search_options":       true,
 	"group":                    true,
+	// Client-only metadata (Codex session/client hints). Stripped after compact
+	// detection so LooksLikeCodexRequest can still see metadata.client.
+	"metadata":                 true,
 }
 
 func SanitizeUpstreamBody(body map[string]any) map[string]any {
@@ -89,7 +92,6 @@ func StabilizePromptBody(body map[string]any) map[string]any {
 		}
 		body["messages"] = stabilized
 	}
-	delete(body, "metadata")
 	body["_prompt_stabilize"] = stats
 	return stats
 }
@@ -108,10 +110,15 @@ func PrepareUpstreamBody(body map[string]any) map[string]any {
 }
 
 // PrepareUpstreamBodyDetailed returns the sanitized upstream body plus stabilize/compact stats.
-func PrepareUpstreamBodyDetailed(body map[string]any) (map[string]any, BodyPrepStats) {
+// Optional userAgent enables Codex default auto-compact when admin auto_chars is 0.
+func PrepareUpstreamBodyDetailed(body map[string]any, userAgent ...string) (map[string]any, BodyPrepStats) {
 	out := cloneAnyMap(body)
 	stabilize := StabilizePromptBody(out)
-	compact := historycompact.Apply(out)
+	ua := ""
+	if len(userAgent) > 0 {
+		ua = userAgent[0]
+	}
+	compact := historycompact.Apply(out, ua)
 	return SanitizeUpstreamBody(out), BodyPrepStats{Stabilize: stabilize, Compact: compact}
 }
 
