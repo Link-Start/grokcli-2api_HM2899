@@ -373,19 +373,184 @@ class TurnstileAPIServer:
                 self._kill_process_tree(proc)
                 if self.debug:
                     logger.debug(f"{label}: force-killed via {attr}")
+                # Do not return: Camoufox often leaves siblings/orphans with no handle.
+                break
+        else:
+            # Nested browser objects (some wrappers)
+            for attr in ("browser", "_browser", "impl_obj", "_impl_obj"):
+                nested = getattr(browser, attr, None)
+                if nested is None or nested is browser:
+                    continue
+                for nested_attr in ("process", "_process"):
+                    proc = getattr(nested, nested_attr, None)
+                    if proc is not None:
+                        self._kill_process_tree(proc)
+                        if self.debug:
+                            logger.debug(
+                                f"{label}: force-killed nested {attr}.{nested_attr}"
+                            )
+                        break
+        # Always fall through: Camoufox AsyncCamoufox exposes no reliable handle,
+        # and orphan playwright node drivers share pgrp=1 with services so only a
+        # precise /proc scan can clean them without collateral damage.
+        await self._reap_camoufox_groups()
+
+    async def _reap_camoufox_groups(self) -> None:
+        """Last-resort cleanup for Camoufox binaries + orphan playwright drivers.
+
+        Context (production postmortem):
+        - Camoufox's AsyncCamoufox does NOT expose .process / ._process, so the
+          attribute-walk force-kill path silently no-ops.
+        - A naive ``"camoufox" in cmdline`` filter matches
+          ``python api_solver.py --browser_type camoufox`` (pgrp=1) and a
+          subsequent killpg(1) suicides grok2api + api_solver + registration.
+        - Real leak shape is: 1 live camoufox-bin (~3G) + many orphan node
+          ``playwright/driver ... run-driver`` children of api_solver (~1.5G).
+
+        Safety rules (hard):
+        1. Match only binary paths (camoufox-bin / browsers/official / contentproc
+           under camoufox). Never match bare ``camoufox`` (hits solver argv).
+        2. Never kill pid/pgrp 1, never kill self, never kill service processes
+           (api_solver / registration_service / grok2api).
+        3. Kill by pid only (no killpg) — orphan drivers share pgrp=1 with services.
+        4. Also reap orphan playwright node drivers whose ppid is this process.
+        Must be called from a shutdown / idle-reclaim path (no browser stays alive).
+        """
+        import os as _os
+        import signal as _sig
+
+        me = _os.getpid()
+        protect = {0, 1, me}
+
+        def _cmdline(pid: int) -> str:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    return fh.read().decode("utf-8", "ignore").replace("\x00", " ")
+            except Exception:
+                return ""
+
+        def _ppid(pid: int):
+            try:
+                with open(f"/proc/{pid}/stat") as sf:
+                    return int(sf.read().split()[3])
+            except Exception:
+                return None
+
+        def _is_service(cmd: str) -> bool:
+            low = cmd.lower()
+            return any(
+                k in low
+                for k in (
+                    "api_solver.py",
+                    "registration_service.py",
+                    "/app/bin/grok2api",
+                    "grok2api-migrate",
+                )
+            )
+
+        def _is_camoufox_binary(cmd: str) -> bool:
+            """Strict: binary path only, never the python --browser_type flag."""
+            if not cmd or _is_service(cmd):
+                return False
+            low = cmd.lower()
+            # Exclude any python interpreter line that merely mentions camoufox.
+            if "python" in low and "camoufox-bin" not in low and "/browsers/official/" not in low:
+                return False
+            return (
+                "camoufox-bin" in low
+                or "/browsers/official/" in low
+                or ("/camoufox/" in low and "-contentproc" in low)
+            )
+
+        def _is_orphan_driver(pid: int, ppid, cmd: str) -> bool:
+            if ppid != me or not cmd or _is_service(cmd):
+                return False
+            low = cmd.lower()
+            return (
+                "playwright/driver" in low
+                or "run-driver" in low
+                or ("node" in low and "playwright" in low)
+            )
+
+        def _safe_kill_pid(pid: int) -> bool:
+            if pid in protect or pid <= 1:
+                return False
+            cmd = _cmdline(pid)
+            if not cmd or _is_service(cmd):
+                return False
+            # Belt-and-suspenders: never touch anything that still looks like us.
+            low = cmd.lower()
+            if "api_solver" in low or "registration_service" in low or "grok2api" in low:
+                return False
+            try:
+                _os.kill(pid, _sig.SIGKILL)
+                return True
+            except Exception:
+                return False
+
+        try:
+            kill_pids: set = set()
+            for pid_s in _os.listdir("/proc"):
+                if not pid_s.isdigit():
+                    continue
+                pid = int(pid_s)
+                if pid in protect:
+                    continue
+                cmd = _cmdline(pid)
+                if not cmd or _is_service(cmd):
+                    continue
+                ppid = _ppid(pid)
+
+                if _is_camoufox_binary(cmd):
+                    kill_pids.add(pid)
+                    # Parent is typically the playwright node driver — kill by pid only.
+                    if ppid and ppid not in protect:
+                        pcmd = _cmdline(ppid)
+                        if pcmd and not _is_service(pcmd):
+                            plow = pcmd.lower()
+                            if "playwright" in plow or "run-driver" in plow:
+                                kill_pids.add(ppid)
+                    continue
+
+                if _is_orphan_driver(pid, ppid, cmd):
+                    kill_pids.add(pid)
+
+            # Second pass: contentproc children under any targeted pid.
+            extra: set = set()
+            if kill_pids:
+                for pid_s in _os.listdir("/proc"):
+                    if not pid_s.isdigit():
+                        continue
+                    pid = int(pid_s)
+                    if pid in protect or pid in kill_pids:
+                        continue
+                    ppid = _ppid(pid)
+                    if ppid in kill_pids:
+                        cmd = _cmdline(pid)
+                        if cmd and not _is_service(cmd):
+                            extra.add(pid)
+            kill_pids |= extra
+
+            # Final safety filter before any kill.
+            kill_pids = {
+                p for p in kill_pids
+                if p not in protect
+                and p > 1
+                and not _is_service(_cmdline(p))
+            }
+            if not kill_pids:
                 return
-        # Nested browser objects (some wrappers)
-        for attr in ("browser", "_browser", "impl_obj", "_impl_obj"):
-            nested = getattr(browser, attr, None)
-            if nested is None or nested is browser:
-                continue
-            for nested_attr in ("process", "_process"):
-                proc = getattr(nested, nested_attr, None)
-                if proc is not None:
-                    self._kill_process_tree(proc)
-                    if self.debug:
-                        logger.debug(f"{label}: force-killed nested {attr}.{nested_attr}")
-                    return
+
+            killed = 0
+            # Higher pid first: prefers leaf contentproc before parent driver.
+            for pid in sorted(kill_pids, reverse=True):
+                if _safe_kill_pid(pid):
+                    killed += 1
+            logger.info(
+                f"Reaped browser leftovers: targeted={len(kill_pids)} killed={killed}"
+            )
+        except Exception as e:
+            logger.warning(f"reap camoufox leftovers failed: {e}")
 
     async def _shutdown_browsers(self) -> None:
         """Close every browser and release Playwright/Camoufox drivers."""
@@ -423,6 +588,10 @@ class TurnstileAPIServer:
                 self._camoufox, "aclose", "close", "__aexit__", label="Camoufox"
             )
             self._camoufox = None
+
+        # Camoufox ignores close()/aclose() — its Firefox process tree survives.
+        # Hard-reap any leftover camoufox groups so instances do not accumulate.
+        await self._reap_camoufox_groups()
 
         # Idle reclaim must not keep a stuck counter forever.
         # If a solve task crashed without finally, _in_flight could block all future reclaim.

@@ -21,6 +21,8 @@ from __future__ import annotations
 import os
 import secrets
 import sys
+import threading
+import time
 from pathlib import Path
 import json
 from typing import Any
@@ -416,11 +418,134 @@ async def start_job(
     return _jsonable(result)
 
 
+# --- Bounded /sessions response.
+# Registration sessions accumulate in the Redis mirror (REG_TTL=72h) and
+# list_registration_sessions() re-merges ALL of them and rebuilds one object per
+# session on every poll -> 2879 sessions => ~9-11MB payload / ~1.3s build that
+# timed out the polling client (Go Timeout=750ms / ResponseHeaderTimeout=600ms),
+# making the UI "refresh progress" appear dead.
+# Fixes:
+#   (a) prune old *terminal* sessions from Redis in a BACKGROUND thread so the
+#       rebuild stays small, without blocking the request path past the 600ms
+#       header budget (cold full-delete of ~3k keys was ~1.5s);
+#   (b) cache the bounded result briefly so repeated polls return instantly;
+#   (c) hard-cap the returned list so body stays well under the 4MB read limit.
+# ACTIVE (non-terminal) sessions are never pruned, so in-flight work is safe.
+_LIST_CACHE: dict[str, Any] = {"t": 0.0, "data": None}
+_LIST_CACHE_TTL = 2.0
+_PRUNE_LAST = {"t": 0.0}
+_PRUNE_INTERVAL = 30.0
+_PRUNE_TERMINAL_TTL = 900.0  # keep terminal sessions in Redis <= 15 min
+_PRUNE_MAX_PER_CYCLE = 300   # bound cold-path work so one cycle never hog Redis
+_PRUNE_STATE = {"running": False}
+_PRUNE_LOCK = threading.Lock()
+_TERMINAL_STATUSES = frozenset({
+    "success", "completed", "done", "failed", "error", "stopped",
+    "abandoned", "expired", "imported", "cancelled", "canceled",
+    "timed_out", "timeout",
+})
+
+
+def _prune_redis_sessions_once() -> int:
+    """Delete up to _PRUNE_MAX_PER_CYCLE old terminal sessions. Returns count."""
+    deleted = 0
+    try:
+        from grok2api.store import sessions_redis
+        if not getattr(sessions_redis, "redis_enabled", lambda: False)():
+            return 0
+        now = time.time()
+        cutoff = now - _PRUNE_TERMINAL_TTL
+        for s in (sessions_redis.reg_sess_list() or []):
+            if deleted >= _PRUNE_MAX_PER_CYCLE:
+                break
+            if not isinstance(s, dict):
+                continue
+            st = str(s.get("status", "")).lower()
+            if st not in _TERMINAL_STATUSES and not s.get("finished"):
+                continue  # never prune active sessions
+            ua = float(s.get("updated_at") or s.get("created_at") or 0)
+            if ua and ua < cutoff:
+                sid = str(s.get("id") or "")
+                if sid:
+                    sessions_redis.reg_sess_delete(sid)
+                    deleted += 1
+    except Exception:
+        pass
+    return deleted
+
+
+def _prune_worker() -> None:
+    try:
+        _prune_redis_sessions_once()
+    finally:
+        with _PRUNE_LOCK:
+            _PRUNE_STATE["running"] = False
+
+
+def _kick_prune_background() -> None:
+    """Non-blocking: fire prune on a daemon thread if interval elapsed."""
+    now = time.time()
+    if now - _PRUNE_LAST["t"] < _PRUNE_INTERVAL:
+        return
+    with _PRUNE_LOCK:
+        if _PRUNE_STATE["running"]:
+            return
+        _PRUNE_STATE["running"] = True
+        _PRUNE_LAST["t"] = now
+    t = threading.Thread(
+        target=_prune_worker,
+        name="reg-sess-prune",
+        daemon=True,
+    )
+    t.start()
+
+
 @app.get(f"{API_PREFIX}/sessions")
 def list_sessions(request: Request) -> dict[str, Any]:
     _require_auth(request)
     adapter = _adapter()
-    return _jsonable(adapter.list_registration_sessions())
+    # Kick prune OFF the request path so ResponseHeaderTimeout(600ms) is safe
+    # even when Redis still holds thousands of terminal rows.
+    _kick_prune_background()
+    now = time.time()
+    if _LIST_CACHE["data"] is not None and (now - _LIST_CACHE["t"]) < _LIST_CACHE_TTL:
+        return _jsonable(_LIST_CACHE["data"])
+    data = adapter.list_registration_sessions()
+    if isinstance(data, dict) and "sessions" in data:
+        sessions = data.get("sessions") or []
+        try:
+            sessions = sorted(
+                sessions,
+                key=lambda s: (s.get("updated_at") or 0),
+                reverse=True,
+            )
+        except Exception:
+            pass
+        terminal = _TERMINAL_STATUSES
+        active = [s for s in sessions
+                  if str(s.get("status", "")).lower() not in terminal]
+        finished = [s for s in sessions
+                    if str(s.get("status", "")).lower() in terminal]
+        KEEP_TERMINAL = 150
+        HARD_CAP = 250
+        # Prefer active (UI progress); append recent terminal; hard-cap total.
+        # If active alone exceeds HARD_CAP (shouldn't with REG_CONCURRENCY=3),
+        # keep the newest active first so live work still shows up.
+        bounded = active + finished[:KEEP_TERMINAL]
+        if len(bounded) > HARD_CAP:
+            bounded = bounded[:HARD_CAP]
+        total = len(sessions)
+        result = {
+            "sessions": bounded,
+            "total": total,
+            "returned": len(bounded),
+            "truncated": total != len(bounded),
+        }
+    else:
+        result = data
+    _LIST_CACHE["data"] = result
+    _LIST_CACHE["t"] = time.time()
+    return _jsonable(result)
 
 
 @app.get(f"{API_PREFIX}/sessions/{{session_id}}")
